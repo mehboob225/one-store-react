@@ -231,7 +231,8 @@ export function foreignKeyArrayNames(objectType: ObjectType): readonly string[] 
   return TYPE_FACTS[objectType].foreignKeyArrays;
 }
 
-export { canonicalKey } from "./canonicalKey";
+export { canonicalKey, isKeyValue } from "./canonicalKey";
+import { isKeyValue as isKey } from "./canonicalKey";
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -264,18 +265,26 @@ const RESERVED_MEMBERS = new Set([...RESERVED, "id"]);
 const RESERVED_BUCKET_NAMES = new Set([...RESERVED_MEMBERS, "generation", "reset", "eventsHandler", "updatedHandler"]);
 
 /**
- * Reserved for generated class names: names a generated `class X` would
- * shadow in its module. A static core list plus whatever is a global in the
- * environment running validation (rejecting more is harmless here).
+ * Reserved for generated class names: the ECMAScript built-ins a generated
+ * `class X` would shadow in its module, plus the base class. Deliberately a
+ * static list: a `globalThis` probe would make a schema's verdict depend on
+ * the runtime doing the validating (happy-dom registers `Comment`, `Text`,
+ * `Image`…; plain Bun does not). Host APIs (`Response`, `URL`) are not
+ * reserved — model modules do not use them.
  */
 const RESERVED_CLASS_NAMES = new Set([
   ...RESERVED,
-  "Object", "Array", "Function", "String", "Number", "Boolean", "Symbol", "BigInt", "Date", "RegExp", "Error",
-  "Map", "Set", "WeakMap", "WeakSet", "Promise", "Proxy", "Reflect", "JSON", "Math", "globalThis", "PassiveModel",
+  "Object", "Function", "Array", "Number", "Boolean", "String", "Symbol", "BigInt", "Date", "RegExp", "Promise",
+  "Error", "AggregateError", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
+  "Map", "Set", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "Proxy", "Reflect", "JSON", "Math", "Intl",
+  "Atomics", "ArrayBuffer", "SharedArrayBuffer", "DataView", "Iterator",
+  "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
+  "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+  "globalThis", "undefined", "NaN", "Infinity", "PassiveModel",
 ]);
 
 function isReservedClassName(name: string): boolean {
-  return RESERVED_CLASS_NAMES.has(name) || Object.hasOwn(globalThis, name);
+  return RESERVED_CLASS_NAMES.has(name);
 }
 
 /** Valid identifier that the generator may emit as a data field, join key or metaData key. */
@@ -293,15 +302,37 @@ function isMemberName(name: string): boolean {
  * an entry, so the entry vanishes before validation can see it. Detect the
  * symptom: a schema record whose prototype is not the plain one.
  */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function isPlainRecord(record: object): boolean {
   const proto = Object.getPrototypeOf(record);
   return proto === Object.prototype || proto === null; // null-prototype maps are the safe way to avoid this
 }
 
-function checkPlainRecord(ctx: TypeContext, property: string, record: object | undefined): void {
-  if (record !== undefined && !isPlainRecord(record)) {
+/**
+ * A schema property that must be a record of entries. Reports (instead of
+ * throwing on) a non-object value, so the validator stays usable on any
+ * input, and reports a non-plain prototype. Returns whether it can be read.
+ */
+function checkPlainRecord(ctx: TypeContext, property: string, record: unknown): record is Record<string, unknown> {
+  if (record === undefined) return false;
+  if (!isRecord(record)) {
+    problem(ctx, `${property} must be an object`);
+    return false;
+  }
+  if (!isPlainRecord(record)) {
     problem(ctx, `${property} has a non-plain prototype (a "__proto__" key in the literal?) — that entry was silently dropped`);
   }
+  return true;
+}
+
+/** An entry inside a schema record must itself be an object. */
+function checkEntry(ctx: TypeContext, label: string, entry: unknown): entry is Record<string, unknown> {
+  if (isRecord(entry)) return true;
+  problem(ctx, `${label} must be an object`);
+  return false;
 }
 
 /** Own-property lookup: a field named "constructor" or "toString" must not resolve to Object.prototype. */
@@ -323,6 +354,10 @@ export function validateModelDefinitions(definitions: Record<string, ModelDefini
   }
 
   for (const [type, def] of Object.entries(definitions)) {
+    if (!isRecord(def)) {
+      problems.push(`${type}: definition must be an object`);
+      continue;
+    }
     const ctx: TypeContext = { definitions, problems, models, type, def, fields: new Map(), members: new Map() };
     for (const check of TYPE_CHECKS) check(ctx);
   }
@@ -376,9 +411,10 @@ function isKnown(ctx: TypeContext, type: string): boolean {
 function collectFields(ctx: TypeContext): void {
   const { def, fields } = ctx;
   if (typeof def.index === "string") fields.set(def.index, "index");
-  for (const field of Object.keys(def.foreignKeys ?? {})) if (!fields.has(field)) fields.set(field, `foreignKeys.${field}`);
-  for (const field of Object.keys(def.foreignKeysArray ?? {})) if (!fields.has(field)) fields.set(field, `foreignKeysArray.${field}`);
-  for (const field of Object.keys(def.embeddedObject ?? {})) if (!fields.has(field)) fields.set(field, `embeddedObject.${field}`);
+  const keysOf = (value: unknown) => (isRecord(value) ? Object.keys(value) : []);
+  for (const field of keysOf(def.foreignKeys)) if (!fields.has(field)) fields.set(field, `foreignKeys.${field}`);
+  for (const field of keysOf(def.foreignKeysArray)) if (!fields.has(field)) fields.set(field, `foreignKeysArray.${field}`);
+  for (const field of keysOf(def.embeddedObject)) if (!fields.has(field)) fields.set(field, `embeddedObject.${field}`);
 }
 
 /**
@@ -416,9 +452,10 @@ function checkModel(ctx: TypeContext): void {
 
 /** `foreignKeys` and `foreignKeysArray`: each points at a known type and claims its getter. */
 function checkPointers(ctx: TypeContext, property: string, pointers: Record<string, ForeignKeyDefinition> | undefined): void {
-  checkPlainRecord(ctx, property, pointers);
-  for (const [field, fk] of Object.entries(pointers ?? {})) {
+  if (!checkPlainRecord(ctx, property, pointers)) return;
+  for (const [field, fk] of Object.entries(pointers)) {
     if (!isEmittable(field)) problem(ctx, `${property} field "${field}" is not a valid identifier or is reserved`);
+    if (!checkEntry(ctx, `${property}.${field}`, fk)) continue;
     if (property === "foreignKeysArray" && own(ctx.def.foreignKeys, field)) {
       problem(ctx, `"${field}" is declared in both foreignKeys and foreignKeysArray`);
     }
@@ -432,10 +469,12 @@ function checkPointers(ctx: TypeContext, property: string, pointers: Record<stri
 
 /** Each relation names a child type that declares `key` as a foreign key pointing back at this type. */
 function checkRelatedObjectTypes(ctx: TypeContext): void {
-  checkPlainRecord(ctx, "relatedObjectType", ctx.def.relatedObjectType);
-  for (const [name, rel] of Object.entries(ctx.def.relatedObjectType ?? {})) {
+  const relations = ctx.def.relatedObjectType;
+  if (!checkPlainRecord(ctx, "relatedObjectType", relations)) return;
+  for (const [name, rel] of Object.entries(relations)) {
     const label = `relatedObjectType.${name}`;
     claimMember(ctx, "relation name", name, label);
+    if (!checkEntry(ctx, label, rel)) continue;
     claimMember(ctx, "getter", rel.getter, label);
     if (!isEmittable(rel.key)) problem(ctx, `${label}.key "${rel.key}" is not a valid identifier or is reserved`);
     if (!isKnown(ctx, rel.objectType)) {
@@ -452,50 +491,65 @@ function checkRelatedObjectTypes(ctx: TypeContext): void {
 }
 
 function checkHasMany(ctx: TypeContext): void {
-  checkPlainRecord(ctx, "hasMany", ctx.def.hasMany);
-  for (const [name, hm] of Object.entries(ctx.def.hasMany ?? {})) checkHasManyEntry(ctx, name, hm);
+  const relations = ctx.def.hasMany;
+  if (!checkPlainRecord(ctx, "hasMany", relations)) return;
+  for (const [name, hm] of Object.entries(relations)) {
+    if (checkEntry(ctx, `hasMany.${name}`, hm)) checkHasManyEntry(ctx, name, hm);
+    else claimMember(ctx, "relation name", name, `hasMany.${name}`);
+  }
 }
 
-/** The join bucket must declare both keys, pointing at the right types, and list this type in `belongsTo`. */
+/**
+ * The join bucket must declare both keys, pointing at the right types, and
+ * list this type in `belongsTo`. Every check that does not need an unknown
+ * type still runs, so one validation pass reports everything it can.
+ */
 function checkHasManyEntry(ctx: TypeContext, name: string, hm: HasManyDefinition): void {
   const label = `hasMany.${name}`;
   const otherType = hm.objectType;
   claimMember(ctx, "relation name", name, label);
   claimMember(ctx, "getter", hm.getter, label);
-  let resolvable = true;
-  if (!isKnown(ctx, otherType)) {
-    problem(ctx, `${label}.objectType "${otherType}" is not a known type`);
-    resolvable = false;
-  }
-  if (!isKnown(ctx, hm.through)) {
-    problem(ctx, `${label}.through "${hm.through}" is not a known type`);
-    resolvable = false;
-  }
-  if (!resolvable) return; // join-key checks against an unknown type would only blame the join table
-  const through = ctx.definitions[hm.through]!;
   for (const key of [hm.thisKey, hm.otherKey]) {
     if (!isEmittable(key)) problem(ctx, `${label}: join key "${key}" is not a valid identifier or is reserved`);
   }
   if (hm.thisKey === hm.otherKey) problem(ctx, `${label}: thisKey and otherKey are both "${hm.thisKey}"`);
+
+  const otherKnown = isKnown(ctx, otherType);
+  if (!otherKnown) problem(ctx, `${label}.objectType "${otherType}" is not a known type`);
+  if (!isKnown(ctx, hm.through)) {
+    problem(ctx, `${label}.through "${hm.through}" is not a known type`);
+    return; // nothing below can be checked without the join bucket
+  }
+  const through = ctx.definitions[hm.through]!;
   checkJoinKey(ctx, label, hm.through, through, hm.thisKey, ctx.type);
-  checkJoinKey(ctx, label, hm.through, through, hm.otherKey, otherType);
-  if (!(through.belongsTo ?? []).includes(ctx.type)) {
+  // with an unknown target, only check that the key is declared — comparing it to "tagz" would blame a correct join table;
+  // identical keys were already reported above, and checking the same field twice would only repeat the message
+  if (hm.otherKey !== hm.thisKey) checkJoinKey(ctx, label, hm.through, through, hm.otherKey, otherKnown ? otherType : undefined);
+  const belongsTo = through.belongsTo;
+  if (!Array.isArray(belongsTo) || !belongsTo.includes(ctx.type)) {
     problem(ctx, `${label}: ${hm.through}.belongsTo must include "${ctx.type}" so association caches invalidate`);
   }
 }
 
-function checkJoinKey(ctx: TypeContext, label: string, throughType: string, through: ModelDefinition, key: string, expected: string): void {
-  const fk = own(through.foreignKeys, key);
+function checkJoinKey(ctx: TypeContext, label: string, throughType: string, through: ModelDefinition, key: string, expected: string | undefined): void {
+  const fk = isRecord(through.foreignKeys) ? own(through.foreignKeys, key) : undefined;
   if (!fk) problem(ctx, `${label}: ${throughType} does not declare foreignKeys.${key}`);
-  else if (fk.objectType !== expected) problem(ctx, `${label}: ${throughType}.${key} points at ${fk.objectType}, not ${expected}`);
+  else if (expected !== undefined && fk.objectType !== expected) {
+    problem(ctx, `${label}: ${throughType}.${key} points at ${fk.objectType}, not ${expected}`);
+  }
 }
 
 /** An embedded field is lifted out of the record, so it must not be a field the record needs. */
 function checkEmbeddedObjects(ctx: TypeContext): void {
   const { def } = ctx;
-  checkPlainRecord(ctx, "embeddedObject", def.embeddedObject);
-  for (const [field, target] of Object.entries(def.embeddedObject ?? {})) {
+  const embedded = def.embeddedObject;
+  if (!checkPlainRecord(ctx, "embeddedObject", embedded)) return;
+  for (const [field, target] of Object.entries(embedded)) {
     if (!isEmittable(field)) problem(ctx, `embeddedObject field "${field}" is not a valid identifier or is reserved`);
+    if (typeof target !== "string") {
+      problem(ctx, `embeddedObject.${field} must name a type`);
+      continue;
+    }
     if (field === def.index) problem(ctx, `embeddedObject.${field} is the index field`);
     if (own(def.foreignKeys, field)) problem(ctx, `embeddedObject.${field} is also declared in foreignKeys`);
     if (own(def.foreignKeysArray, field)) problem(ctx, `embeddedObject.${field} is also declared in foreignKeysArray`);
@@ -504,14 +558,26 @@ function checkEmbeddedObjects(ctx: TypeContext): void {
 }
 
 function checkBelongsTo(ctx: TypeContext): void {
-  for (const target of ctx.def.belongsTo ?? []) {
-    if (!isKnown(ctx, target)) problem(ctx, `belongsTo includes unknown type "${target}"`);
+  const { belongsTo } = ctx.def;
+  if (belongsTo === undefined) return;
+  if (!Array.isArray(belongsTo)) {
+    problem(ctx, "belongsTo must be an array of type names");
+    return;
+  }
+  for (const target of belongsTo) {
+    if (typeof target !== "string" || !isKnown(ctx, target)) problem(ctx, `belongsTo includes unknown type "${String(target)}"`);
   }
 }
 
 function checkMetaData(ctx: TypeContext): void {
-  for (const key of ctx.def.metaData ?? []) {
-    if (!isEmittable(key)) problem(ctx, `metaData key "${key}" is not a valid identifier or is reserved`);
+  const { metaData } = ctx.def;
+  if (metaData === undefined) return;
+  if (!Array.isArray(metaData)) {
+    problem(ctx, "metaData must be an array of keys");
+    return;
+  }
+  for (const key of metaData) {
+    if (typeof key !== "string" || !isEmittable(key)) problem(ctx, `metaData key "${String(key)}" is not a valid identifier or is reserved`);
   }
 }
 
@@ -527,11 +593,9 @@ export function assertValidModelDefinitions(definitions: Record<string, ModelDef
  * bucket nobody subscribes to, silently.
  */
 export function isForeignKeyValue(value: unknown): boolean {
-  if (value === null || value === undefined) return true;
-  if (typeof value === "number") return Number.isFinite(value);
-  // ids are whatever the server says (a string "1.0" is a different id from 1, not a typo),
-  // but nothing legitimately produces padding, and " 1" would never match a subscriber's key
-  return typeof value === "string" && value !== "" && value.trim() === value;
+  // ids are whatever the server says (a string "1.0" is a different id from 1, not a typo);
+  // the rule for what can be a key lives in canonicalKey.ts and is shared with the event bus
+  return value === null || value === undefined || isKey(value);
 }
 
 /** What a `foreignKeysArray` field may hold: an array of non-null foreign-key values, or null/undefined. */
@@ -554,13 +618,29 @@ export function isForeignKeyArrayValue(value: unknown): boolean {
  * The index is required and may not be null; foreign keys may be absent
  * (partial update) or null.
  */
+/** Facts for custom definitions maps (tests, tooling), computed once per map and type. */
+const CUSTOM_FACTS = new WeakMap<Record<string, ModelDefinition>, Map<string, TypeFacts>>();
+
+function factsOf(objectType: string, definitions: Record<string, ModelDefinition> | undefined): TypeFacts {
+  if (definitions === undefined) {
+    if (!Object.hasOwn(TYPE_FACTS, objectType)) throw new TypeError(`unknown object type "${objectType}" (is it a singular push name?)`);
+    return TYPE_FACTS[objectType as ObjectType];
+  }
+  let perType = CUSTOM_FACTS.get(definitions);
+  if (!perType) CUSTOM_FACTS.set(definitions, (perType = new Map()));
+  let facts = perType.get(objectType);
+  if (!facts) {
+    if (!Object.hasOwn(definitions, objectType)) throw new TypeError(`unknown object type "${objectType}"`);
+    facts = factsFor(definitions[objectType]!);
+    perType.set(objectType, facts);
+  }
+  return facts;
+}
+
 export function invalidForeignKeyFields(objectType: ObjectType, record: Record<string, unknown>): string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): string[] {
-  const facts =
-    definitions === undefined
-      ? TYPE_FACTS[objectType as ObjectType]
-      : factsFor(definitions[objectType] ?? (() => { throw new TypeError(`unknown object type "${objectType}"`); })());
+  const facts = factsOf(objectType, definitions);
   const bad = new Set<string>();
   const id = own(record, facts.index);
   if (id === null || id === undefined || !isForeignKeyValue(id)) bad.add(facts.index);
@@ -573,8 +653,10 @@ export function invalidForeignKeyFields(objectType: string, record: Record<strin
   return [...bad];
 }
 
-export function assertForeignKeyValues(objectType: ObjectType, record: Record<string, unknown>): void {
-  const bad = invalidForeignKeyFields(objectType, record);
+export function assertForeignKeyValues(objectType: ObjectType, record: Record<string, unknown>): void;
+export function assertForeignKeyValues(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): void;
+export function assertForeignKeyValues(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): void {
+  const bad = definitions === undefined ? invalidForeignKeyFields(objectType as ObjectType, record) : invalidForeignKeyFields(objectType, record, definitions);
   if (bad.length > 0) {
     throw new TypeError(
       `${objectType} record has invalid index/foreign key value(s): ${bad.join(", ")} ` +

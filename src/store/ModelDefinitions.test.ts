@@ -14,8 +14,10 @@ import {
   objectTypes,
   validateModelDefinitions,
   type ForeignKeyDefinition,
+  type HasManyDefinition,
   type ModelDefinition,
   type ObjectType,
+  type RelatedObjectTypeDefinition,
 } from "./ModelDefinitions";
 
 describe("the real ModelDefinitions", () => {
@@ -438,11 +440,79 @@ describe("validateModelDefinitions", () => {
     ]);
   });
 
-  test("model names that are globals in this environment are refused, not just a static list (review 4, finding 7)", () => {
-    for (const model of ["Response", "URL", "Uint8Array", "globalThis", "Intl"]) {
+  test("model-name verdicts do not depend on the runtime: ECMAScript built-ins are refused, host globals are not (review 5, findings 1, 8)", () => {
+    for (const model of ["Object", "Map", "Promise", "Uint8Array", "Intl", "TypeError", "globalThis", "PassiveModel"]) {
       expect(withDefs({ things: { index: "id", model } })).toEqual([`things: model "${model}" is a reserved name`]);
     }
-    expect(withDefs({ things: { index: "id", model: "ThingModel" } })).toEqual([]);
+    // happy-dom registers these on globalThis under `bun test`; plain bun and the generator do not — same verdict here
+    for (const model of ["Comment", "Text", "Image", "Response", "URL", "ThingModel"]) {
+      expect(withDefs({ things: { index: "id", model } })).toEqual([]);
+    }
+    expect(Object.hasOwn(globalThis, "Comment")).toBe(true); // proves the environment would have flipped the old check
+  });
+
+  test("the validator reports instead of throwing on null or wrongly typed entries (review 5, findings 4, 7)", () => {
+    expect(validateModelDefinitions({ things: null as unknown as ModelDefinition })).toEqual(["things: definition must be an object"]);
+    expect(withDefs({ things: { index: "id", foreignKeys: { x: null as unknown as ForeignKeyDefinition } } })).toEqual(["things: foreignKeys.x must be an object"]);
+    expect(withDefs({ things: { index: "id", foreignKeys: "nope" as unknown as ModelDefinition["foreignKeys"] } })).toEqual(["things: foreignKeys must be an object"]);
+    expect(withDefs({ things: { index: "id", relatedObjectType: { t: null as unknown as RelatedObjectTypeDefinition } } })).toEqual(["things: relatedObjectType.t must be an object"]);
+    expect(withDefs({ things: { index: "id", hasMany: { t: 5 as unknown as HasManyDefinition } } })).toEqual(["things: hasMany.t must be an object"]);
+    expect(withDefs({ things: { index: "id", embeddedObject: { a: 1 as unknown as string } } })).toEqual(["things: embeddedObject.a must name a type"]);
+    expect(withDefs({ things: { index: "id", belongsTo: "users" as unknown as string[] } })).toEqual(["things: belongsTo must be an array of type names"]);
+    expect(withDefs({ things: { index: "id", metaData: "x" as unknown as string[] } })).toEqual(["things: metaData must be an array of keys"]);
+    // a string belongsTo on the join bucket no longer satisfies hasMany through String.prototype.includes
+    expect(
+      withDefs({
+        tags: { index: "id", model: "TagModel" },
+        tasks: { index: "id", hasMany: { tags: { objectType: "tags", through: "joins", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } } },
+        joins: {
+          index: "id",
+          foreignKeys: { task_id: { objectType: "tasks", getter: "getTask" }, tag_id: { objectType: "tags", getter: "getTag" } },
+          belongsTo: "tasks,tags" as unknown as string[],
+        },
+      }),
+    ).toEqual([
+      'tasks: hasMany.tags: joins.belongsTo must include "tasks" so association caches invalidate',
+      "joins: belongsTo must be an array of type names",
+    ]);
+  });
+
+  test("an unknown hasMany target still gets every check that does not need it (review 5, finding 5)", () => {
+    expect(
+      withDefs({
+        tasks: { index: "id", hasMany: { tags: { objectType: "tagz", through: "task_tags", thisKey: "task_id", otherKey: "task_id", getter: "getTags" } } },
+        task_tags: { index: "id", foreignKeys: { tag_id: { objectType: "users", getter: "getTag" } } },
+      }),
+    ).toEqual([
+      'tasks: hasMany.tags: thisKey and otherKey are both "task_id"',
+      'tasks: hasMany.tags.objectType "tagz" is not a known type',
+      "tasks: hasMany.tags: task_tags does not declare foreignKeys.task_id",
+      'tasks: hasMany.tags: task_tags.belongsTo must include "tasks" so association caches invalidate',
+    ]);
+  });
+
+  test("the write guard rejects unknown and prototype-named types clearly, on both paths (review 5, finding 2)", () => {
+    expect(() => invalidForeignKeyFields("project" as ObjectType, { id: 1 })).toThrow(/unknown object type "project" \(is it a singular push name\?\)/);
+    expect(() => invalidForeignKeyFields("toString" as ObjectType, { id: 1 })).toThrow(/unknown object type "toString"/);
+    expect(() => assertForeignKeyValues("constructor" as ObjectType, { id: 1 })).toThrow(/unknown object type/);
+    const defs: Record<string, ModelDefinition> = { things: { index: "id" } };
+    expect(() => invalidForeignKeyFields("toString", { id: 1 }, defs)).toThrow(/unknown object type "toString"/);
+    expect(() => assertForeignKeyValues("nope", { id: 1 }, defs)).toThrow(/unknown object type "nope"/);
+    expect(invalidForeignKeyFields("things", { id: 1 }, defs)).toEqual([]);
+  });
+
+  test("the event bus and the write guard share one key rule (review 5, finding 3)", async () => {
+    const { isKeyValue } = await import("./canonicalKey");
+    for (const bad of [NaN, Infinity, "", " 1", "1 "]) {
+      expect(isKeyValue(bad)).toBe(false);
+      expect(isForeignKeyValue(bad)).toBe(false);
+    }
+    for (const ok of [1, "1", "a b"]) {
+      expect(isKeyValue(ok)).toBe(true);
+      expect(isForeignKeyValue(ok)).toBe(true);
+    }
+    expect(isKeyValue(null)).toBe(false); // a key is never null…
+    expect(isForeignKeyValue(null)).toBe(true); // …but a foreign key may be
   });
 
   test("the index may not be declared as an array foreign key (review 3, finding 1)", () => {

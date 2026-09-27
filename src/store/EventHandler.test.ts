@@ -99,7 +99,7 @@ describe("eventKey", () => {
 
   test("selectors that would never fire throw: null or non-scalar id/key, and id together with a foreign key", () => {
     expect(() => eventKey({ objectType: "tasks", id: null } as never)).toThrow(/undefined id/);
-    expect(() => eventKey({ objectType: "tasks", id: {} } as never)).toThrow(/string or number id/);
+    expect(() => eventKey({ objectType: "tasks", id: {} } as never)).toThrow(/finite number or non-empty string id/);
     expect(() => eventKey({ objectType: "tasks", keyName: "project_id", key: {} } as never)).toThrow(/both keyName and key/);
     expect(() => eventKey({ objectType: "tasks", id: 7, keyName: "project_id", key: 1 } as never)).toThrow(/both an id and a foreign key/);
     expect(eventKey({ objectType: "tasks", id: 7, keyName: null, key: null } as never)).toBe("tasks/7");
@@ -179,6 +179,18 @@ describe("DataEventHandler", () => {
     await tick();
     expect(batches).toHaveLength(1);
     expect(batches[0]!.ids).toEqual([7]);
+  });
+
+  test("keys follow the shared rule: NaN, empty and padded ids are skipped on broadcast and refused on subscribe (review 5, finding 3)", async () => {
+    const bus = new DataEventHandler();
+    const ids: unknown[] = [];
+    bus.subscribe({ objectType: "tasks" }, (b) => ids.push(...b.ids));
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: NaN }, { id: "" }, { id: " 1" }, { id: 2 }] });
+    await tick();
+    expect(ids).toEqual([2]);
+    expect(() => bus.subscribe({ objectType: "tasks", id: NaN }, () => {})).toThrow(/finite number or non-empty string/);
+    expect(() => bus.subscribe({ objectType: "tasks", id: "" }, () => {})).toThrow(TypeError);
+    expect(() => bus.subscribe({ objectType: "tasks", keyName: "project_id", key: " 1" }, () => {})).toThrow(TypeError);
   });
 
   test("a custom index field is honoured and objects without an index value are skipped", async () => {

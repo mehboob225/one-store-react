@@ -82,6 +82,8 @@ export function seed(): SeedData {
     users: [
       { id: 1, name: "Ada Lovelace", email: "ada@example.com", password: "password", settings: { theme: "dark" } },
       { id: 2, name: "Grace Hopper", email: "grace@example.com", password: "password", settings: {} },
+      // on no project: invisible to the others through GET /users
+      { id: 3, name: "Alan Turing", email: "alan@example.com", password: "password", settings: {} },
     ],
     projects: [
       { id: 1, name: "Analytical Engine", owner_id: 1, member_ids: [1, 2], created_at: "2026-09-01T09:00:00Z" },

@@ -17,7 +17,7 @@ shapes, or the factories (step 11) are the place to adapt.
 | Not found | `404 {"error":"<thing> not found"}`; unknown `/api/*` paths are JSON 404, never the HTML fallback |
 | Response shape | an object keyed by bucket name: lists `{ tasks: [...] }`, singles `{ task: {...} }` |
 | Embedded objects | `tasks` carry `assignee` (a public user or `null`); the client lifts it into the `users` bucket |
-| User representations | public users (`user`, `assignee`) carry `id`, `name`, `email` only; `current_user` additionally carries `settings` and is only ever sent to that user |
+| User representations | public users (`user`, `assignee`, `/users`) carry `id` and `name` only; `current_user` additionally carries `email` and `settings` and is only ever sent to that user |
 | Deletions | mutations may include `deleted_<bucket>: [ids]`; the client removes those ids |
 | Optimistic locking | `tasks` carry a `hash`; `PUT` must send the current one or gets `409 {"error":"conflict", task}` |
 | Validation | every write body is validated (`src/server/validation.ts`): unknown and server-owned fields are dropped, badly typed values return `400 {"error"}` and nothing is written or broadcast |
@@ -29,6 +29,7 @@ shapes, or the factories (step 11) are the place to adapt.
 |---|---|
 | `ada@example.com` | `password` |
 | `grace@example.com` | `password` |
+| `alan@example.com` | `password` (on no project) |
 
 ## Endpoints
 
@@ -36,7 +37,7 @@ shapes, or the factories (step 11) are the place to adapt.
 |---|---|---|---|---|
 | POST | `/sign_in` | `{email, password}` (non-empty strings) | `{uuid, token, user}`, `400` on a bad body | — |
 | DELETE | `/sign_out` | — | `{ok: true}`; that session's sockets get `session_invalid` and close | — |
-| GET | `/users` | — | `{users: []}` (public users: `id`, `name`, `email`) — fills the `users` bucket so `owner_id`, `member_ids`, `author_id` resolve | — |
+| GET | `/users` | — | `{users: []}` — the users sharing a project with the caller (owners and members), caller included; fills the `users` bucket so `owner_id`, `member_ids`, `author_id` resolve without letting an account enumerate every account | — |
 | GET | `/users/current` | — | `{user, current_user}` (`current_user` carries `settings`) | — |
 | PUT | `/users/current/settings` | `{settings}` (plain object) | `{current_user}` (settings merged), `400` otherwise | `update current_user` **to that user only** |
 | GET | `/projects` | — | `{projects: []}` (each with `owner_id`, `member_ids`) | — |

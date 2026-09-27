@@ -17,7 +17,8 @@ import {
 import { MUTABLE_TASK_FIELDS, type MutableTaskField } from "./validation";
 
 /** What other users may see: no password, no settings. */
-export type PublicUser = Omit<UserRow, "password" | "settings">;
+/** What other users may see: id and name only — never email, password or settings. */
+export type PublicUser = Pick<UserRow, "id" | "name">;
 
 /** What the logged-in user sees about themselves. */
 export type CurrentUser = Omit<UserRow, "password">;
@@ -69,9 +70,19 @@ export class Database {
     return this.data.users.find((u) => u.email === email);
   }
 
-  /** Every user, public representation. Fills the `users` bucket so owner/member/author keys resolve. */
-  listUsers(): PublicUser[] {
-    return this.data.users.map(publicUser);
+  /**
+   * The users the caller may know about: everyone who owns or is a member of
+   * a project the caller owns or is a member of (the caller included). Fills
+   * the `users` bucket so owner/member/author keys resolve, without letting
+   * any signed-in account enumerate every account in the system.
+   */
+  listUsersSharingProjectsWith(userId: number): PublicUser[] {
+    const visible = new Set<number>([userId]);
+    for (const project of this.data.projects) {
+      const participants = [project.owner_id, ...project.member_ids];
+      if (participants.includes(userId)) for (const id of participants) visible.add(id);
+    }
+    return this.data.users.filter((u) => visible.has(u.id)).map(publicUser);
   }
 
   getUser(id: number): PublicUser | undefined {
@@ -191,8 +202,7 @@ function maxId(rows: { id: number }[]): number {
 }
 
 function publicUser(user: UserRow): PublicUser {
-  const { password: _p, settings: _s, ...rest } = user;
-  return rest;
+  return { id: user.id, name: user.name };
 }
 
 function currentUser(user: UserRow): CurrentUser {

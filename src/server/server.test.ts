@@ -49,8 +49,7 @@ describe("auth", () => {
     const body = (await res.json()) as Record<string, unknown>;
     expect(typeof body.uuid).toBe("string");
     expect(typeof body.token).toBe("string");
-    expect((body.user as Record<string, unknown>).email).toBe("ada@example.com");
-    expect(body.user as Record<string, unknown>).not.toHaveProperty("password");
+    expect(body.user).toEqual({ id: 1, name: "Ada Lovelace" }); // public: no email, password or settings
   });
 
   test("sign_in rejects non-string or missing credentials with 400", async () => {
@@ -87,12 +86,23 @@ describe("auth", () => {
 });
 
 describe("users", () => {
-  test("GET /users lists every user in the public representation (fills the users bucket)", async () => {
-    const body = (await (await api("/users")).json()) as { users: Record<string, unknown>[] };
-    expect(body.users.map((u) => u.id)).toEqual([1, 2]);
-    for (const u of body.users) {
-      expect(Object.keys(u).sort()).toEqual(["email", "id", "name"]);
-    }
+  test("GET /users lists only users sharing a project with the caller, as id and name (review: no enumeration, no emails)", async () => {
+    const ada = (await (await api("/users")).json()) as { users: Record<string, unknown>[] };
+    expect(ada.users).toEqual([
+      { id: 1, name: "Ada Lovelace" },
+      { id: 2, name: "Grace Hopper" },
+    ]); // Alan (id 3) shares no project with Ada
+
+    const alan = (await (await api("/users", {}, await authHeaderFor("alan@example.com"))).json()) as { users: unknown[] };
+    expect(alan.users).toEqual([{ id: 3, name: "Alan Turing" }]); // only himself
+  });
+
+  test("no public representation anywhere carries an email", async () => {
+    const grace = await authHeaderFor("grace@example.com");
+    const { user } = (await (await api("/users/current", {}, grace)).json()) as { user: Record<string, unknown>; current_user: Record<string, unknown> };
+    expect(user).toEqual({ id: 2, name: "Grace Hopper" });
+    const { task } = (await (await api("/tasks/1", {}, grace)).json()) as { task: { assignee: Record<string, unknown> } };
+    expect(task.assignee).toEqual({ id: 1, name: "Ada Lovelace" });
   });
 
   test("GET /users/current returns user and current_user buckets", async () => {

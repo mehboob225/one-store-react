@@ -49,7 +49,7 @@
  *    so batches are always delivered in the order they were queued.
  */
 
-import { canonicalKey } from "./canonicalKey";
+import { canonicalKey, isKeyValue } from "./canonicalKey";
 
 export type Unsubscribe = () => void;
 
@@ -193,13 +193,13 @@ function resolve(selector: DataEventSelector): Resolved {
   }
   if (hasForeignKey) {
     if (typeof keyName !== "string" || !isIndexValue(key)) {
-      throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key (a string or number)`);
+      throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key (a finite number or non-empty string)`);
     }
     const value = canonicalKey(key);
     return { kind: "fk", objectType, keyName, value, label: `${objectType}/${keyName}/${value}` };
   }
   if (hasId) {
-    if (!isIndexValue(id)) throw new TypeError(`eventKey: selector for "${objectType}" needs a string or number id`);
+    if (!isIndexValue(id)) throw new TypeError(`eventKey: selector for "${objectType}" needs a finite number or non-empty string id`);
     const canon = canonicalKey(id);
     return { kind: "id", objectType, id: canon, label: `${objectType}/${canon}` };
   }
@@ -453,6 +453,7 @@ function indexById(objects: readonly Row[], index: string): Map<string, Row> {
   return map;
 }
 
+/** Same rule as the write guard: one place decides what a key is (see canonicalKey.ts). */
 function isIndexValue(value: unknown): value is IndexValue {
-  return typeof value === "number" || typeof value === "string";
+  return isKeyValue(value);
 }
