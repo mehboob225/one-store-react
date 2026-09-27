@@ -1,3 +1,30 @@
+# one-store-react
+
+A Bun + React 19 boilerplate built around one rule:
+
+> **Server data lives in exactly one place — `AppDataFactory`, a mutable normalized
+> cache. Everything else is either a way to get data *into* it (factories, loaders,
+> push) or a way to find out it *changed* (Jotai timestamp atoms).**
+
+The step-by-step build plan lives in `PLAN.md` at the repo root (local, gitignored).
+Each step is one PR; every PR must keep `bun run check`, `bun test` and
+`bun run build` green.
+
+## Scripts
+
+- `bun dev` — hot-reloading dev server (`src/index.ts` serves `src/index.html`)
+- `bun run check` — `tsc --noEmit`
+- `bun test` — unit + component tests (happy-dom is preloaded via `test/setup.ts`)
+- `bun run build` — static production build to `dist/`
+
+## Conventions
+
+- Components never fetch and never hold server state; they declare loaders and read the store.
+- Atoms never fetch; they subscribe to store events and re-read inside `useMemo`.
+- Every factory method ends in a store write (`saveAppData` / `deleteAppData`).
+
+---
+
 
 Default to using Bun instead of Node.js.
 
