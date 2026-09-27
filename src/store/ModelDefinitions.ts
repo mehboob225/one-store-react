@@ -178,10 +178,12 @@ export type DeepReadonly<T> = T extends (infer U)[]
     ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
     : T;
 
-function deepFreeze<T>(value: T): T {
-  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+/** Freezes every reachable object, including children of already-frozen ones. */
+function deepFreeze<T>(value: T, seen = new Set<object>()): T {
+  if (typeof value === "object" && value !== null && !seen.has(value)) {
+    seen.add(value);
     Object.freeze(value);
-    for (const inner of Object.values(value as Record<string, unknown>)) deepFreeze(inner);
+    for (const inner of Object.values(value as Record<string, unknown>)) deepFreeze(inner, seen);
   }
   return value;
 }
@@ -200,14 +202,47 @@ export function definitionFor(objectType: ObjectType): DeepReadonly<ModelDefinit
   return ModelDefinitions[objectType];
 }
 
-/** Names of the declared single foreign keys — what the event bus and grouped indexes need. */
-export function foreignKeyNames(objectType: ObjectType): string[] {
-  return Object.keys(definitionFor(objectType).foreignKeys ?? {});
+/** Per-type facts the write path needs, computed once (the schema is frozen). */
+interface TypeFacts {
+  readonly index: string;
+  readonly foreignKeys: readonly string[];
+  readonly foreignKeyArrays: readonly string[];
 }
 
-/** Names of the declared id-array foreign keys. */
-export function foreignKeyArrayNames(objectType: ObjectType): string[] {
-  return Object.keys(definitionFor(objectType).foreignKeysArray ?? {});
+const TYPE_FACTS: Readonly<Record<ObjectType, TypeFacts>> = Object.freeze(
+  Object.fromEntries(
+    objectTypes.map((type) => {
+      const def = ModelDefinitions[type] as ModelDefinition;
+      return [
+        type,
+        Object.freeze({
+          index: def.index,
+          foreignKeys: Object.freeze(Object.keys(def.foreignKeys ?? {})),
+          foreignKeyArrays: Object.freeze(Object.keys(def.foreignKeysArray ?? {})),
+        }),
+      ];
+    }),
+  ) as Record<ObjectType, TypeFacts>,
+);
+
+/** Names of the declared single foreign keys — what the event bus and grouped indexes need. Cached. */
+export function foreignKeyNames(objectType: ObjectType): readonly string[] {
+  return TYPE_FACTS[objectType].foreignKeys;
+}
+
+/** Names of the declared id-array foreign keys. Cached. */
+export function foreignKeyArrayNames(objectType: ObjectType): readonly string[] {
+  return TYPE_FACTS[objectType].foreignKeyArrays;
+}
+
+/**
+ * The one canonical form of an index or foreign-key value for use as a Map
+ * key. The write guard lets a key hold numbers or strings, and the event bus
+ * keys on the string form; every index the cache builds (getById, grouped,
+ * association) MUST key on this too, or `1` and `"1"` become two objects.
+ */
+export function canonicalKey(value: string | number): string {
+  return typeof value === "string" ? value : String(value);
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +250,50 @@ export function foreignKeyArrayNames(objectType: ObjectType): string[] {
 // ---------------------------------------------------------------------------
 
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/**
+ * Names that are syntactically identifiers but cannot be emitted as a class
+ * member, class name or property by the generator: JS reserved words, the
+ * members every object/class already has, and PassiveModel's own methods.
+ */
+const RESERVED = new Set([
+  // reserved words (ES2020 + strict mode)
+  "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum",
+  "export", "extends", "false", "finally", "for", "function", "if", "import", "in", "instanceof", "new", "null",
+  "return", "super", "switch", "this", "throw", "true", "try", "typeof", "var", "void", "while", "with", "yield",
+  "let", "static", "implements", "interface", "package", "private", "protected", "public", "await", "arguments", "eval",
+  // class / object plumbing
+  "constructor", "prototype", "__proto__", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__",
+  "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toString", "toLocaleString", "valueOf",
+  // PassiveModel (step 8) instance API
+  "initializeFromJson", "clone",
+]);
+
+/** Additionally reserved for generated members (getters, relation names): the model's own `id` field. */
+const RESERVED_MEMBERS = new Set([...RESERVED, "id"]);
+
+/** Additionally reserved for generated class names: globals a generated `class X` would shadow in its module. */
+const RESERVED_CLASS_NAMES = new Set([
+  ...RESERVED,
+  "Object", "Array", "Function", "String", "Number", "Boolean", "Symbol", "BigInt", "Date", "RegExp", "Error",
+  "Map", "Set", "WeakMap", "WeakSet", "Promise", "Proxy", "Reflect", "JSON", "Math", "PassiveModel",
+]);
+
+/** Valid identifier that the generator may emit as a data field, join key or class name. */
+function isEmittable(name: string): boolean {
+  return IDENTIFIER.test(name) && !RESERVED.has(name);
+}
+
+/**
+ * A `__proto__` key in an object literal sets the prototype instead of adding
+ * an entry, so the entry vanishes before validation can see it. Detect the
+ * symptom: a schema record whose prototype is not the plain one.
+ */
+function checkPlainRecord(ctx: TypeContext, property: string, record: object | undefined): void {
+  if (record !== undefined && Object.getPrototypeOf(record) !== Object.prototype) {
+    problem(ctx, `${property} has a non-plain prototype (a "__proto__" key in the literal?) — that entry was silently dropped`);
+  }
+}
 
 /** Own-property lookup: a field named "constructor" or "toString" must not resolve to Object.prototype. */
 function own<T>(record: Record<string, T> | undefined, key: string): T | undefined {
@@ -274,6 +353,7 @@ function isKnown(ctx: TypeContext, type: string): boolean {
 /** A getter must be a valid identifier and unique within its type. */
 function claimGetter(ctx: TypeContext, getter: string, owner: string): void {
   if (!IDENTIFIER.test(getter)) problem(ctx, `${owner} getter "${getter}" is not a valid identifier`);
+  else if (RESERVED_MEMBERS.has(getter)) problem(ctx, `${owner} getter "${getter}" is a reserved name`);
   const previous = ctx.getters.get(getter);
   if (previous) problem(ctx, `getter "${getter}" is declared by both ${previous} and ${owner}`);
   else ctx.getters.set(getter, owner);
@@ -290,6 +370,7 @@ function checkModel(ctx: TypeContext): void {
   const { model } = ctx.def;
   if (model === undefined) return;
   if (!IDENTIFIER.test(model)) problem(ctx, `model "${model}" is not a valid identifier`);
+  else if (RESERVED_CLASS_NAMES.has(model)) problem(ctx, `model "${model}" is a reserved name`);
   const owner = ctx.models.get(model);
   if (owner) problem(ctx, `model "${model}" is also used by ${owner}`);
   else ctx.models.set(model, ctx.type);
@@ -297,10 +378,14 @@ function checkModel(ctx: TypeContext): void {
 
 /** `foreignKeys` and `foreignKeysArray`: each points at a known type and claims its getter. */
 function checkPointers(ctx: TypeContext, property: string, pointers: Record<string, ForeignKeyDefinition> | undefined): void {
+  checkPlainRecord(ctx, property, pointers);
   for (const [field, fk] of Object.entries(pointers ?? {})) {
-    if (!IDENTIFIER.test(field)) problem(ctx, `${property} field "${field}" is not a valid identifier`);
+    if (!isEmittable(field)) problem(ctx, `${property} field "${field}" is not a valid identifier or is reserved`);
     if (property === "foreignKeysArray" && own(ctx.def.foreignKeys, field)) {
       problem(ctx, `"${field}" is declared in both foreignKeys and foreignKeysArray`);
+    }
+    if (property === "foreignKeysArray" && field === ctx.def.index) {
+      problem(ctx, `foreignKeysArray.${field} is the index field (the index must be a scalar)`);
     }
     if (!isKnown(ctx, fk.objectType)) problem(ctx, `${property}.${field} points at unknown type "${fk.objectType}"`);
     claimGetter(ctx, fk.getter, `${property}.${field}`);
@@ -309,11 +394,12 @@ function checkPointers(ctx: TypeContext, property: string, pointers: Record<stri
 
 /** Each relation names a child type that declares `key` as a foreign key pointing back at this type. */
 function checkRelatedObjectTypes(ctx: TypeContext): void {
+  checkPlainRecord(ctx, "relatedObjectType", ctx.def.relatedObjectType);
   for (const [name, rel] of Object.entries(ctx.def.relatedObjectType ?? {})) {
     const label = `relatedObjectType.${name}`;
-    if (!IDENTIFIER.test(name)) problem(ctx, `${label}: relation name is not a valid identifier`);
+    if (!isEmittable(name)) problem(ctx, `${label}: relation name is not a valid identifier or is reserved`);
     claimGetter(ctx, rel.getter, label);
-    if (!IDENTIFIER.test(rel.key)) problem(ctx, `${label}.key "${rel.key}" is not a valid identifier`);
+    if (!isEmittable(rel.key)) problem(ctx, `${label}.key "${rel.key}" is not a valid identifier or is reserved`);
     if (!isKnown(ctx, rel.objectType)) {
       problem(ctx, `${label}.objectType "${rel.objectType}" is not a known type`);
       continue;
@@ -328,6 +414,7 @@ function checkRelatedObjectTypes(ctx: TypeContext): void {
 }
 
 function checkHasMany(ctx: TypeContext): void {
+  checkPlainRecord(ctx, "hasMany", ctx.def.hasMany);
   for (const [name, hm] of Object.entries(ctx.def.hasMany ?? {})) checkHasManyEntry(ctx, name, hm);
 }
 
@@ -335,16 +422,21 @@ function checkHasMany(ctx: TypeContext): void {
 function checkHasManyEntry(ctx: TypeContext, name: string, hm: HasManyDefinition): void {
   const label = `hasMany.${name}`;
   const otherType = hm.objectType;
-  if (!IDENTIFIER.test(name)) problem(ctx, `${label}: relation name is not a valid identifier`);
+  if (!isEmittable(name)) problem(ctx, `${label}: relation name is not a valid identifier or is reserved`);
   claimGetter(ctx, hm.getter, label);
-  if (!isKnown(ctx, otherType)) problem(ctx, `${label}.objectType "${otherType}" is not a known type`);
+  let resolvable = true;
+  if (!isKnown(ctx, otherType)) {
+    problem(ctx, `${label}.objectType "${otherType}" is not a known type`);
+    resolvable = false;
+  }
   if (!isKnown(ctx, hm.through)) {
     problem(ctx, `${label}.through "${hm.through}" is not a known type`);
-    return;
+    resolvable = false;
   }
+  if (!resolvable) return; // join-key checks against an unknown type would only blame the join table
   const through = ctx.definitions[hm.through]!;
   for (const key of [hm.thisKey, hm.otherKey]) {
-    if (!IDENTIFIER.test(key)) problem(ctx, `${label}: join key "${key}" is not a valid identifier`);
+    if (!isEmittable(key)) problem(ctx, `${label}: join key "${key}" is not a valid identifier or is reserved`);
   }
   if (hm.thisKey === hm.otherKey) problem(ctx, `${label}: thisKey and otherKey are both "${hm.thisKey}"`);
   checkJoinKey(ctx, label, hm.through, through, hm.thisKey, ctx.type);
@@ -363,8 +455,9 @@ function checkJoinKey(ctx: TypeContext, label: string, throughType: string, thro
 /** An embedded field is lifted out of the record, so it must not be a field the record needs. */
 function checkEmbeddedObjects(ctx: TypeContext): void {
   const { def } = ctx;
+  checkPlainRecord(ctx, "embeddedObject", def.embeddedObject);
   for (const [field, target] of Object.entries(def.embeddedObject ?? {})) {
-    if (!IDENTIFIER.test(field)) problem(ctx, `embeddedObject field "${field}" is not a valid identifier`);
+    if (!isEmittable(field)) problem(ctx, `embeddedObject field "${field}" is not a valid identifier or is reserved`);
     if (field === def.index) problem(ctx, `embeddedObject.${field} is the index field`);
     if (own(def.foreignKeys, field)) problem(ctx, `embeddedObject.${field} is also declared in foreignKeys`);
     if (own(def.foreignKeysArray, field)) problem(ctx, `embeddedObject.${field} is also declared in foreignKeysArray`);
@@ -395,16 +488,22 @@ export function assertValidModelDefinitions(definitions: Record<string, ModelDef
  * number, or null/undefined. NaN, Infinity and "" would land an object in a
  * bucket nobody subscribes to, silently.
  */
-export function isForeignKeyValue(value: unknown): value is string | number | null | undefined {
+export function isForeignKeyValue(value: unknown): boolean {
   if (value === null || value === undefined) return true;
   if (typeof value === "number") return Number.isFinite(value);
   return typeof value === "string" && value !== "";
 }
 
 /** What a `foreignKeysArray` field may hold: an array of non-null foreign-key values, or null/undefined. */
-export function isForeignKeyArrayValue(value: unknown): value is (string | number)[] | null | undefined {
+export function isForeignKeyArrayValue(value: unknown): boolean {
   if (value === null || value === undefined) return true;
-  return Array.isArray(value) && value.every((v) => v !== null && v !== undefined && isForeignKeyValue(v));
+  if (!Array.isArray(value)) return false;
+  // an index loop, not `every`: `every` skips holes, so a sparse array would pass
+  for (let i = 0; i < value.length; i++) {
+    const v: unknown = value[i];
+    if (v === null || v === undefined || !isForeignKeyValue(v)) return false;
+  }
+  return true;
 }
 
 /**
@@ -416,17 +515,17 @@ export function isForeignKeyArrayValue(value: unknown): value is (string | numbe
  * (partial update) or null.
  */
 export function invalidForeignKeyFields(objectType: ObjectType, record: Record<string, unknown>): string[] {
-  const bad: string[] = [];
-  const { index } = definitionFor(objectType);
-  const id = own(record, index);
-  if (id === null || id === undefined || !isForeignKeyValue(id)) bad.push(index);
-  for (const field of foreignKeyNames(objectType)) {
-    if (Object.hasOwn(record, field) && !isForeignKeyValue(record[field])) bad.push(field);
+  const facts = TYPE_FACTS[objectType];
+  const bad = new Set<string>();
+  const id = own(record, facts.index);
+  if (id === null || id === undefined || !isForeignKeyValue(id)) bad.add(facts.index);
+  for (const field of facts.foreignKeys) {
+    if (Object.hasOwn(record, field) && !isForeignKeyValue(record[field])) bad.add(field);
   }
-  for (const field of foreignKeyArrayNames(objectType)) {
-    if (Object.hasOwn(record, field) && !isForeignKeyArrayValue(record[field])) bad.push(field);
+  for (const field of facts.foreignKeyArrays) {
+    if (Object.hasOwn(record, field) && !isForeignKeyArrayValue(record[field])) bad.add(field);
   }
-  return bad;
+  return [...bad];
 }
 
 export function assertForeignKeyValues(objectType: ObjectType, record: Record<string, unknown>): void {
