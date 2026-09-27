@@ -371,7 +371,7 @@ export class DataEventHandler {
    * value changed — the bucket it left.
    */
   private enqueueForeignKey(values: Map<string, Target>, objectType: string, fk: string, id: IndexValue, object: Row, before: Row | undefined): void {
-    const present = fk in object;
+    const present = Object.hasOwn(object, fk); // own properties only, like the write guard: data fields are own, accessors live on the prototype
     const current = present ? object[fk] : before?.[fk];
     this.enqueueForeignValue(values, objectType, fk, current, id);
 

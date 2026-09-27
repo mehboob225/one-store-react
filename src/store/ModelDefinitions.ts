@@ -287,8 +287,12 @@ const RESERVED_CLASS_NAMES = new Set([
   // global functions and values
   "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURI", "encodeURIComponent", "decodeURI", "decodeURIComponent",
   "escape", "unescape", "globalThis", "undefined", "NaN", "Infinity",
-  "PassiveModel",
+  // the generator's own classes and registries (step 8)
+  "PassiveModel", "DataCache", "DataCacheIndex", "AppDataFactory", "AppDataModelFactory", "ModelConstructors",
 ]);
+
+/** The generator emits `<Model>AppData` base classes, so no model may take that suffix itself. */
+const GENERATED_SUFFIX = "AppData";
 
 function isReservedClassName(name: string): boolean {
   return RESERVED_CLASS_NAMES.has(name);
@@ -474,6 +478,7 @@ function checkModel(ctx: TypeContext): void {
   }
   if (!IDENTIFIER.test(model)) problem(ctx, `model "${model}" is not a valid identifier`);
   else if (isReservedClassName(model)) problem(ctx, `model "${model}" is a reserved name`);
+  else if (model.endsWith(GENERATED_SUFFIX)) problem(ctx, `model "${model}" ends with "${GENERATED_SUFFIX}", the suffix of generated base classes`);
   const owner = ctx.models.get(model);
   if (owner) problem(ctx, `model "${model}" is also used by ${owner}`);
   else ctx.models.set(model, ctx.type);
@@ -605,8 +610,11 @@ function checkBelongsTo(ctx: TypeContext): void {
     problem(ctx, "belongsTo must be an array of type names");
     return;
   }
+  const seen = new Set<string>();
   for (const target of belongsTo) {
     if (typeof target !== "string" || !isKnown(ctx, target)) problem(ctx, `belongsTo includes unknown type "${String(target)}"`);
+    else if (seen.has(target)) problem(ctx, `belongsTo lists "${target}" twice`);
+    else seen.add(target);
   }
 }
 
@@ -617,8 +625,11 @@ function checkMetaData(ctx: TypeContext): void {
     problem(ctx, "metaData must be an array of keys");
     return;
   }
+  const seen = new Set<string>();
   for (const key of metaData) {
     if (typeof key !== "string" || !isEmittable(key)) problem(ctx, `metaData key "${String(key)}" is not a valid identifier or is reserved`);
+    else if (seen.has(key)) problem(ctx, `metaData lists "${key}" twice`);
+    else seen.add(key);
   }
 }
 
@@ -645,8 +656,7 @@ export function isForeignKeyArrayValue(value: unknown): boolean {
   if (!Array.isArray(value)) return false;
   // an index loop, not `every`: `every` skips holes, so a sparse array would pass
   for (let i = 0; i < value.length; i++) {
-    const v: unknown = value[i];
-    if (v === null || v === undefined || !isForeignKeyValue(v)) return false;
+    if (!isKeyValue(value[i])) return false;
   }
   return true;
 }
@@ -671,6 +681,9 @@ function factsOf(objectType: string, definitions: Record<string, ModelDefinition
   return factsFor(def as ModelDefinition);
 }
 
+/** Shared result for the common case, so a clean write allocates nothing. */
+const NO_BAD_FIELDS: readonly string[] = Object.freeze([]);
+
 /**
  * Checks one record's index field and declared foreign-key fields (single
  * and array). Returns the offending field names; empty means fine. The
@@ -680,9 +693,6 @@ function factsOf(objectType: string, definitions: Record<string, ModelDefinition
  * (partial update) or null. Pass a definitions map to check against a
  * schema other than the built-in one.
  */
-/** Shared result for the common case, so a clean write allocates nothing. */
-const NO_BAD_FIELDS: readonly string[] = Object.freeze([]);
-
 export function invalidForeignKeyFields(objectType: ObjectType, record: Record<string, unknown>): readonly string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): readonly string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): readonly string[] {

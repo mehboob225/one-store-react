@@ -261,6 +261,18 @@ describe("DataEventHandler", () => {
       expect(batches.map((b) => [b.key, b.ids])).toEqual([["tasks/project_id/42", [7]]]);
     });
 
+    test("only OWN foreign-key fields count as present, like the write guard (review 8, finding 4)", async () => {
+      const bus = new DataEventHandler();
+      const keys: string[] = [];
+      bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => keys.push(b.key));
+      bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 43 }, (b) => keys.push(b.key));
+      // project_id inherited from the prototype: not a data field, so not "present" → the object stays in bucket 42
+      const object = Object.assign(Object.create({ project_id: 43 }) as Record<string, unknown>, { id: 7, title: "x" });
+      bus.broadcast({ objectType: "tasks", action: "update", objects: [object], previous: [{ id: 7, project_id: 42 }], foreignKeys: ["project_id"] });
+      await tick();
+      expect(keys).toEqual(["tasks/project_id/42"]);
+    });
+
     test("`previous` entries whose id is not in `objects` are ignored", async () => {
       const bus = new DataEventHandler();
       const batches: DataEventBatch[] = [];

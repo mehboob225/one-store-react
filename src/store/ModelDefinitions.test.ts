@@ -590,6 +590,22 @@ describe("validateModelDefinitions", () => {
     }
   });
 
+  test("model names may not clash with the generator's own classes or its AppData suffix (review 8, finding 8)", () => {
+    for (const model of ["DataCache", "DataCacheIndex", "AppDataFactory", "AppDataModelFactory", "ModelConstructors"]) {
+      expect(withDefs({ things: { index: "id", model } })).toEqual([`things: model "${model}" is a reserved name`]);
+    }
+    expect(withDefs({ a: { index: "id", model: "X" }, b: { index: "id", model: "XAppData" } })).toEqual([
+      'b: model "XAppData" ends with "AppData", the suffix of generated base classes',
+    ]);
+  });
+
+  test("duplicate belongsTo and metaData entries are reported (review 8, finding 9)", () => {
+    expect(withDefs({ t: { index: "id", belongsTo: ["users", "users"], metaData: ["a", "a"] } })).toEqual([
+      't: belongsTo lists "users" twice',
+      't: metaData lists "a" twice',
+    ]);
+  });
+
   test("cascadeDelete must be a boolean (review 7, finding 5)", () => {
     expect(
       withDefs({

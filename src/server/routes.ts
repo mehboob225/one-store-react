@@ -36,8 +36,20 @@ async function json<T>(req: Request): Promise<T | undefined> {
 
 export function createRoutes(ctx: RouteContext) {
   const { db, sessions, push } = ctx;
-  /** An assignee is optional, but when given it must be a real user, so `assignee_id` always resolves. */
-  const assigneeExists = (assigneeId: number | null | undefined) => assigneeId == null || db.getUser(assigneeId) !== undefined;
+  /**
+   * An assignee is optional, but when given it must be the project's owner or
+   * a member: then `assignee_id` always resolves, and a project's members
+   * (`getMembers()`) always include its assignees. Returns the 400 to send,
+   * or undefined when the assignee is acceptable.
+   */
+  const assigneeProblem = (projectId: number, assigneeId: number | null | undefined): Response | undefined => {
+    if (assigneeId == null) return undefined;
+    const project = db.getProject(projectId);
+    if (!project || ![project.owner_id, ...project.member_ids].includes(assigneeId)) {
+      return badRequest("task.assignee_id must be the project owner or a project member");
+    }
+    return undefined;
+  };
 
   /** Wraps a handler so it runs only for authenticated requests. */
   function authed<P extends string>(
@@ -125,7 +137,8 @@ export function createRoutes(ctx: RouteContext) {
         const body = await json<{ task?: unknown }>(req);
         const input = validateNewTask(body?.task);
         if (!input.ok) return badRequest(input.error);
-        if (!assigneeExists(input.value.assignee_id)) return badRequest("task.assignee_id does not refer to a user");
+        const rejected = assigneeProblem(projectId, input.value.assignee_id);
+        if (rejected) return rejected;
         const task = db.withAssignee(db.createTask(projectId, input.value));
         push.broadcast({ type: "new", objectType: "task", data: task });
         return Response.json({ task }, { status: 201 });
@@ -160,7 +173,15 @@ export function createRoutes(ctx: RouteContext) {
         const body = await json<{ task?: unknown }>(req);
         const patch = validateTaskPatch(body?.task);
         if (!patch.ok) return badRequest(patch.error);
-        if (!assigneeExists(patch.value.assignee_id)) return badRequest("task.assignee_id does not refer to a user");
+        // Order matters: 404, then 409 (the conflict response carries the current task the
+        // client needs to recover), then the assignee rule.
+        const current = db.getTask(id);
+        if (!current) return notFound("task");
+        if (patch.value.hash !== current.hash) {
+          return Response.json({ error: "conflict", task: db.withAssignee(current) }, { status: 409 });
+        }
+        const rejected = assigneeProblem(current.project_id, patch.value.assignee_id);
+        if (rejected) return rejected;
         try {
           const task = db.updateTask(id, patch.value);
           if (!task) return notFound("task");

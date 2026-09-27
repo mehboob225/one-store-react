@@ -241,20 +241,34 @@ describe("projects and tasks", () => {
     }
   });
 
-  test("assignee_id must refer to an existing user on create and update, so it always resolves", async () => {
-    const created = await api("/projects/1/tasks", { method: "POST", body: JSON.stringify({ task: { title: "x", assignee_id: 999 } }) });
-    expect(created.status).toBe(400);
-    expect(((await created.json()) as { error: string }).error).toContain("assignee_id");
+  test("assignee_id must be the project owner or a member, on create and update", async () => {
+    const post = (task: object) => api("/projects/1/tasks", { method: "POST", body: JSON.stringify({ task }) });
+    for (const assignee_id of [999, 3]) {
+      // 999 does not exist; 3 (Alan) exists but is on no project
+      const created = await post({ title: "x", assignee_id });
+      expect(created.status).toBe(400);
+      expect(((await created.json()) as { error: string }).error).toContain("project owner or a project member");
+    }
+    expect((await post({ title: "x", assignee_id: 2 })).status).toBe(201); // Grace is a member of project 1
 
     const { hash } = ((await (await api("/tasks/1")).json()) as { task: { hash: string } }).task;
-    const updated = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash, assignee_id: 999 } }) });
-    expect(updated.status).toBe(400);
+    expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash, assignee_id: 3 } }) })).status).toBe(400);
 
-    const ok = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash, assignee_id: 3 } }) });
+    const ok = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash, assignee_id: 2 } }) });
     expect(ok.status).toBe(200);
-    expect(((await ok.json()) as { task: { assignee: { id: number } } }).task.assignee.id).toBe(3);
-    const cleared = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash: "t1-2", assignee_id: null } }) });
+    const after = ((await ok.json()) as { task: { hash: string; assignee: { id: number } } }).task;
+    expect(after.assignee.id).toBe(2);
+    const cleared = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash: after.hash, assignee_id: null } }) });
     expect(cleared.status).toBe(200);
+  });
+
+  test("PUT /tasks/:id answers 404, then 409, before the assignee rule", async () => {
+    // unknown task: 404 even with a bad assignee
+    expect((await api("/tasks/999", { method: "PUT", body: JSON.stringify({ task: { hash: "x", assignee_id: 3 } }) })).status).toBe(404);
+    // stale hash: 409 carrying the current task, even with a bad assignee
+    const stale = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash: "stale", assignee_id: 3 } }) });
+    expect(stale.status).toBe(409);
+    expect(((await stale.json()) as { task: { id: number; hash: string } }).task).toMatchObject({ id: 1, hash: "t1-1" });
   });
 
   test("POST /projects/:id/tasks/import returns only a count", async () => {
