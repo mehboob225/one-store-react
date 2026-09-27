@@ -43,6 +43,10 @@
  * The exported map is deep-frozen; `definitionFor` returns a readonly view.
  */
 
+import { canonicalKey, isKeyValue } from "./canonicalKey";
+
+export { canonicalKey, isKeyValue };
+
 export interface ForeignKeyDefinition {
   /** The bucket the value points at. */
   objectType: string;
@@ -211,8 +215,11 @@ interface TypeFacts {
 }
 
 function factsFor(def: ModelDefinition): TypeFacts {
-  const keysOf = (value: unknown) => Object.freeze(isRecord(value) ? Object.keys(value) : []);
-  return Object.freeze({ index: def.index, foreignKeys: keysOf(def.foreignKeys), foreignKeyArrays: keysOf(def.foreignKeysArray) });
+  return Object.freeze({
+    index: def.index,
+    foreignKeys: Object.freeze(keysOf(def.foreignKeys)),
+    foreignKeyArrays: Object.freeze(keysOf(def.foreignKeysArray)),
+  });
 }
 
 const TYPE_FACTS: Readonly<Record<ObjectType, TypeFacts>> = Object.freeze(
@@ -229,8 +236,6 @@ export function foreignKeyArrayNames(objectType: ObjectType): readonly string[] 
   return TYPE_FACTS[objectType].foreignKeyArrays;
 }
 
-export { canonicalKey, isKeyValue } from "./canonicalKey";
-import { isKeyValue as isKey } from "./canonicalKey";
 
 // ---------------------------------------------------------------------------
 // Validation
@@ -337,8 +342,13 @@ function checkEntry(ctx: TypeContext, label: string, entry: unknown): entry is R
 }
 
 /** Own-property lookup: a field named "constructor" or "toString" must not resolve to Object.prototype. */
-function own<T>(record: Record<string, T> | undefined, key: string): T | undefined {
-  return record !== undefined && Object.hasOwn(record, key) ? record[key] : undefined;
+function own<T>(record: Record<string, T> | null | undefined, key: string): T | undefined {
+  return isRecord(record) && Object.hasOwn(record, key) ? (record as Record<string, T>)[key] : undefined;
+}
+
+/** The own keys of a record, or none when the value is not a record (null, a string, …). */
+function keysOf(value: unknown): string[] {
+  return isRecord(value) ? Object.keys(value) : [];
 }
 
 /**
@@ -350,6 +360,7 @@ export function validateModelDefinitions(definitions: Record<string, ModelDefini
   const problems: string[] = [];
   const models = new Map<string, string>();
 
+  if (!isRecord(definitions)) return ["definitions must be an object"];
   if (!isPlainRecord(definitions)) {
     problems.push('the definitions map has a non-plain prototype (a "__proto__" key in the literal?) — that entry was silently dropped');
   }
@@ -422,7 +433,6 @@ function referenced(ctx: TypeContext, type: string): ModelDefinition | undefined
 function collectFields(ctx: TypeContext): void {
   const { def, fields } = ctx;
   if (typeof def.index === "string") fields.set(def.index, "index");
-  const keysOf = (value: unknown) => (isRecord(value) ? Object.keys(value) : []);
   for (const field of keysOf(def.foreignKeys)) if (!fields.has(field)) fields.set(field, `foreignKeys.${field}`);
   for (const field of keysOf(def.foreignKeysArray)) if (!fields.has(field)) fields.set(field, `foreignKeysArray.${field}`);
   for (const field of keysOf(def.embeddedObject)) if (!fields.has(field)) fields.set(field, `embeddedObject.${field}`);
@@ -495,6 +505,9 @@ function checkRelatedObjectTypes(ctx: TypeContext): void {
     claimMember(ctx, "relation name", name, label);
     if (!checkEntry(ctx, label, rel)) continue;
     claimMember(ctx, "getter", rel.getter, label);
+    if (rel.cascadeDelete !== undefined && typeof rel.cascadeDelete !== "boolean") {
+      problem(ctx, `${label}.cascadeDelete must be a boolean`);
+    }
     const keyOk = isEmittable(rel.key);
     if (!keyOk) problem(ctx, `${label}.key "${String(rel.key)}" is not a valid identifier or is reserved`);
     if (!isKnown(ctx, rel.objectType)) {
@@ -623,7 +636,7 @@ export function assertValidModelDefinitions(definitions: Record<string, ModelDef
 export function isForeignKeyValue(value: unknown): boolean {
   // ids are whatever the server says (a string "1.0" is a different id from 1, not a typo);
   // the rule for what can be a key lives in canonicalKey.ts and is shared with the event bus
-  return value === null || value === undefined || isKey(value);
+  return value === null || value === undefined || isKeyValue(value);
 }
 
 /** What a `foreignKeysArray` field may hold: an array of non-null foreign-key values, or null/undefined. */
@@ -639,32 +652,23 @@ export function isForeignKeyArrayValue(value: unknown): boolean {
 }
 
 /**
- * Facts for custom definitions maps (tests, tooling). Cached only for FROZEN
- * maps: a mutable map may gain a foreign key after the first call, and a
- * cached entry would then let a bad value through.
+ * Resolves the facts for `objectType`, with a clear error for anything that
+ * is not a usable definition. The built-in map uses the precomputed table.
+ * A custom map (tests, tooling) is read on every call and never cached: a
+ * cache keyed on the map cannot know when an inner definition is mutated,
+ * and that path is not the hot one.
  */
-const CUSTOM_FACTS = new WeakMap<Record<string, ModelDefinition>, Map<string, TypeFacts>>();
-
-/** Resolves the facts for `objectType`, with a clear error for anything that is not a usable definition. */
 function factsOf(objectType: string, definitions: Record<string, ModelDefinition> | undefined): TypeFacts {
   if (definitions === undefined) {
     if (!Object.hasOwn(TYPE_FACTS, objectType)) throw new TypeError(`unknown object type "${objectType}" (is it a singular push name?)`);
     return TYPE_FACTS[objectType as ObjectType];
   }
   if (!Object.hasOwn(definitions, objectType)) throw new TypeError(`unknown object type "${objectType}"`);
-  const cacheable = Object.isFrozen(definitions);
-  const cached = cacheable ? CUSTOM_FACTS.get(definitions)?.get(objectType) : undefined;
-  if (cached) return cached;
-
   const def = definitions[objectType];
-  if (!isRecord(def) || typeof def.index !== "string") throw new TypeError(`definition for "${objectType}" is not a usable definition (object with a string index)`);
-  const facts = factsFor(def as ModelDefinition);
-  if (cacheable) {
-    let perType = CUSTOM_FACTS.get(definitions);
-    if (!perType) CUSTOM_FACTS.set(definitions, (perType = new Map()));
-    perType.set(objectType, facts);
+  if (!isRecord(def) || typeof def.index !== "string") {
+    throw new TypeError(`definition for "${objectType}" is not a usable definition (object with a string index)`);
   }
-  return facts;
+  return factsFor(def as ModelDefinition);
 }
 
 /**
@@ -676,20 +680,26 @@ function factsOf(objectType: string, definitions: Record<string, ModelDefinition
  * (partial update) or null. Pass a definitions map to check against a
  * schema other than the built-in one.
  */
-export function invalidForeignKeyFields(objectType: ObjectType, record: Record<string, unknown>): string[];
-export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): string[];
-export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): string[] {
+/** Shared result for the common case, so a clean write allocates nothing. */
+const NO_BAD_FIELDS: readonly string[] = Object.freeze([]);
+
+export function invalidForeignKeyFields(objectType: ObjectType, record: Record<string, unknown>): readonly string[];
+export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): readonly string[];
+export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): readonly string[] {
   const facts = factsOf(objectType, definitions);
-  const bad = new Set<string>();
-  const id = own(record, facts.index);
-  if (id === null || id === undefined || !isForeignKeyValue(id)) bad.add(facts.index);
+  let bad: string[] | undefined;
+  const flag = (field: string) => {
+    bad ??= [];
+    if (!bad.includes(field)) bad.push(field); // the index may also be a foreign key: report it once
+  };
+  if (!isKeyValue(own(record, facts.index))) flag(facts.index);
   for (const field of facts.foreignKeys) {
-    if (Object.hasOwn(record, field) && !isForeignKeyValue(record[field])) bad.add(field);
+    if (Object.hasOwn(record, field) && !isForeignKeyValue(record[field])) flag(field);
   }
   for (const field of facts.foreignKeyArrays) {
-    if (Object.hasOwn(record, field) && !isForeignKeyArrayValue(record[field])) bad.add(field);
+    if (Object.hasOwn(record, field) && !isForeignKeyArrayValue(record[field])) flag(field);
   }
-  return [...bad];
+  return bad ?? NO_BAD_FIELDS;
 }
 
 export function assertForeignKeyValues(objectType: ObjectType, record: Record<string, unknown>): void;

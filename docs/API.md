@@ -43,7 +43,7 @@ shapes, or the factories (step 11) are the place to adapt.
 | GET | `/projects` | — | `{projects: []}` (each with `owner_id`, `member_ids`) | — |
 | GET | `/projects/:id` | — | `{project}` (with `owner_id`, `member_ids`) | — |
 | GET | `/projects/:id/tasks` | — | `{tasks: []}` with embedded `assignee` | — |
-| POST | `/projects/:id/tasks` | `{task: {title, status?, assignee_id?, due_on?}}` | `201 {task}`, `400` on bad values (same rules as `PUT`) | `new task` |
+| POST | `/projects/:id/tasks` | `{task: {title, status?, assignee_id?, due_on?}}` | `201 {task}`, `400` on bad values (same rules as `PUT`); `assignee_id`, when given, must be an existing user | `new task` |
 | POST | `/projects/:id/tasks/import` | — | `{imported: n}` **only a count** | `reload project` |
 | GET | `/tasks/:id` | — | `{task}` with embedded `assignee` | — |
 | PUT | `/tasks/:id` | `{task: {hash, title?, status?, assignee_id?, due_on?}}` | `{task}` with new `hash`, `400` on bad values, or `409` | `update task` |

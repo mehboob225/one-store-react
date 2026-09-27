@@ -172,7 +172,7 @@ describe("projects and tasks", () => {
     expect(body.projects.map((p) => p.id)).toEqual([1, 2]);
     expect(body.projects.map((p) => [p.owner_id, p.member_ids])).toEqual([
       [1, [1, 2]],
-      [2, [2]],
+      [2, [2, 1]],
     ]);
   });
 
@@ -231,6 +231,30 @@ describe("projects and tasks", () => {
     expect(comments.comments.map((c) => c.id)).toEqual([3]);
     const tags = (await (await api("/tasks/2/tags")).json()) as { tags: { name: string }[] };
     expect(tags.tags.map((t) => t.name)).toEqual(["hardware", "urgent"]);
+  });
+
+  test("every task assignee in the seed is a member of its project", async () => {
+    const projects = ((await (await api("/projects")).json()) as { projects: { id: number; owner_id: number; member_ids: number[] }[] }).projects;
+    for (const p of projects) {
+      const tasks = ((await (await api(`/projects/${p.id}/tasks`)).json()) as { tasks: { assignee_id: number | null }[] }).tasks;
+      for (const t of tasks) if (t.assignee_id !== null) expect([p.owner_id, ...p.member_ids]).toContain(t.assignee_id);
+    }
+  });
+
+  test("assignee_id must refer to an existing user on create and update, so it always resolves", async () => {
+    const created = await api("/projects/1/tasks", { method: "POST", body: JSON.stringify({ task: { title: "x", assignee_id: 999 } }) });
+    expect(created.status).toBe(400);
+    expect(((await created.json()) as { error: string }).error).toContain("assignee_id");
+
+    const { hash } = ((await (await api("/tasks/1")).json()) as { task: { hash: string } }).task;
+    const updated = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash, assignee_id: 999 } }) });
+    expect(updated.status).toBe(400);
+
+    const ok = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash, assignee_id: 3 } }) });
+    expect(ok.status).toBe(200);
+    expect(((await ok.json()) as { task: { assignee: { id: number } } }).task.assignee.id).toBe(3);
+    const cleared = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash: "t1-2", assignee_id: null } }) });
+    expect(cleared.status).toBe(200);
   });
 
   test("POST /projects/:id/tasks/import returns only a count", async () => {

@@ -36,6 +36,8 @@ async function json<T>(req: Request): Promise<T | undefined> {
 
 export function createRoutes(ctx: RouteContext) {
   const { db, sessions, push } = ctx;
+  /** An assignee is optional, but when given it must be a real user, so `assignee_id` always resolves. */
+  const assigneeExists = (assigneeId: number | null | undefined) => assigneeId == null || db.getUser(assigneeId) !== undefined;
 
   /** Wraps a handler so it runs only for authenticated requests. */
   function authed<P extends string>(
@@ -123,6 +125,7 @@ export function createRoutes(ctx: RouteContext) {
         const body = await json<{ task?: unknown }>(req);
         const input = validateNewTask(body?.task);
         if (!input.ok) return badRequest(input.error);
+        if (!assigneeExists(input.value.assignee_id)) return badRequest("task.assignee_id does not refer to a user");
         const task = db.withAssignee(db.createTask(projectId, input.value));
         push.broadcast({ type: "new", objectType: "task", data: task });
         return Response.json({ task }, { status: 201 });
@@ -157,6 +160,7 @@ export function createRoutes(ctx: RouteContext) {
         const body = await json<{ task?: unknown }>(req);
         const patch = validateTaskPatch(body?.task);
         if (!patch.ok) return badRequest(patch.error);
+        if (!assigneeExists(patch.value.assignee_id)) return badRequest("task.assignee_id does not refer to a user");
         try {
           const task = db.updateTask(id, patch.value);
           if (!task) return notFound("task");

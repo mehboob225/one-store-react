@@ -192,14 +192,14 @@ function resolve(selector: DataEventSelector): Resolved {
     throw new TypeError(`eventKey: selector for "${objectType}" has both an id and a foreign key; pick one`);
   }
   if (hasForeignKey) {
-    if (typeof keyName !== "string" || !isIndexValue(key)) {
+    if (typeof keyName !== "string" || !isKeyValue(key)) {
       throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key (a finite number or non-empty string)`);
     }
     const value = canonicalKey(key);
     return { kind: "fk", objectType, keyName, value, label: `${objectType}/${keyName}/${value}` };
   }
   if (hasId) {
-    if (!isIndexValue(id)) throw new TypeError(`eventKey: selector for "${objectType}" needs a finite number or non-empty string id`);
+    if (!isKeyValue(id)) throw new TypeError(`eventKey: selector for "${objectType}" needs a finite number or non-empty string id`);
     const canon = canonicalKey(id);
     return { kind: "id", objectType, id: canon, label: `${objectType}/${canon}` };
   }
@@ -272,7 +272,7 @@ export class DataEventHandler {
 
     for (const object of objects) {
       const id = object[index];
-      if (!isIndexValue(id)) continue;
+      if (!isKeyValue(id)) continue;
       const canon = canonicalKey(id);
 
       if (type.bucket.size > 0) this.enqueue(type.bucket, objectType, objectType, id);
@@ -377,14 +377,14 @@ export class DataEventHandler {
 
     // Only a field present in the write can have moved the object out of its old bucket.
     const old = present ? before?.[fk] : undefined;
-    if (isIndexValue(old) && (!isIndexValue(current) || canonicalKey(old) !== canonicalKey(current))) {
+    if (isKeyValue(old) && (!isKeyValue(current) || canonicalKey(old) !== canonicalKey(current))) {
       this.enqueueForeignValue(values, objectType, fk, old, id);
     }
   }
 
   /** Queues `id` for the subscribers of `fk = value`, if `value` is a scalar somebody watches. */
   private enqueueForeignValue(values: Map<string, Target>, objectType: string, fk: string, value: unknown, id: IndexValue): void {
-    if (!isIndexValue(value)) return;
+    if (!isKeyValue(value)) return;
     const canon = canonicalKey(value);
     const target = values.get(canon);
     if (target) this.enqueue(target, `${objectType}/${fk}/${canon}`, objectType, id);
@@ -448,12 +448,8 @@ function indexById(objects: readonly Row[], index: string): Map<string, Row> {
   const map = new Map<string, Row>();
   for (const object of objects) {
     const id = object[index];
-    if (isIndexValue(id)) map.set(canonicalKey(id), object);
+    if (isKeyValue(id)) map.set(canonicalKey(id), object);
   }
   return map;
 }
 
-/** Same rule as the write guard: one place decides what a key is (see canonicalKey.ts). */
-function isIndexValue(value: unknown): value is IndexValue {
-  return isKeyValue(value);
-}

@@ -542,7 +542,14 @@ describe("validateModelDefinitions", () => {
     ]);
   });
 
-  test("the custom-map guard rejects unusable definitions clearly and caches facts only for frozen maps (review 6, findings 6, 7)", () => {
+  test("the custom-map guard rejects unusable definitions clearly and never caches, so any mutation is seen (review 6 findings 6, 7; review 7 finding 2)", () => {
+    // a frozen outer map with a mutable inner definition: the case a frozen-map cache would miss
+    const inner: ModelDefinition = { index: "id" };
+    const outerFrozen = Object.freeze({ t: inner }) as Record<string, ModelDefinition>;
+    expect(invalidForeignKeyFields("t", { id: 1, fk: NaN }, outerFrozen)).toEqual([]);
+    inner.foreignKeys = { fk: { objectType: "t", getter: "getFk" } };
+    expect(invalidForeignKeyFields("t", { id: 1, fk: NaN }, outerFrozen)).toEqual(["fk"]);
+
     expect(() => invalidForeignKeyFields("x", { id: 1 }, { x: null as unknown as ModelDefinition })).toThrow(/definition for "x" is not a usable definition/);
     expect(() => invalidForeignKeyFields("x", { id: 1 }, { x: { index: 5 as unknown as string } })).toThrow(/not a usable definition/);
     expect(invalidForeignKeyFields("x", { id: 1, "0": true }, { x: { index: "id", foreignKeys: "nope" as unknown as ModelDefinition["foreignKeys"] } })).toEqual([]);
@@ -553,10 +560,43 @@ describe("validateModelDefinitions", () => {
     mutable.tasks!.foreignKeys!.owner_id = { objectType: "users", getter: "getOwner" };
     expect(invalidForeignKeyFields("tasks", { id: 1, owner_id: NaN }, mutable)).toEqual(["owner_id"]);
 
-    // frozen map: cached, and frozen means it cannot change anyway
-    const frozen = Object.freeze({ tasks: Object.freeze({ index: "id", foreignKeys: Object.freeze({ owner_id: { objectType: "users", getter: "getOwner" } }) }) }) as Record<string, ModelDefinition>;
-    expect(invalidForeignKeyFields("tasks", { id: 1, owner_id: NaN }, frozen)).toEqual(["owner_id"]);
-    expect(invalidForeignKeyFields("tasks", { id: 1, owner_id: 2 }, frozen)).toEqual([]);
+  });
+
+  test("the guard allocates nothing for a clean record and reports the index once when it is also a foreign key (review 7, findings 7, 10)", () => {
+    const clean = invalidForeignKeyFields("tasks", { id: 1, project_id: 1 });
+    expect(clean).toEqual([]);
+    expect(Object.isFrozen(clean)).toBe(true);
+    expect(invalidForeignKeyFields("tasks", { id: 2, project_id: 1 })).toBe(clean); // the shared empty result
+    const oneToOne: Record<string, ModelDefinition> = { users: { index: "id" }, profiles: { index: "id", foreignKeys: { id: { objectType: "users", getter: "getUser" } } } };
+    expect(invalidForeignKeyFields("profiles", { id: NaN }, oneToOne)).toEqual(["id"]);
+    expect(invalidForeignKeyFields("profiles", { id: null }, oneToOne)).toEqual(["id"]); // the index may not be null even as a FK
+  });
+
+  test("null or mistyped foreignKeys / foreignKeysArray are reported, never thrown on, and produce no false clash (review 7, finding 1)", () => {
+    expect(
+      withDefs({ t: { index: "id", foreignKeys: null as unknown as ModelDefinition["foreignKeys"], foreignKeysArray: { m: { objectType: "users", getter: "getM" } } } }),
+    ).toEqual(["t: foreignKeys must be an object"]);
+    expect(
+      withDefs({ t: { index: "id", foreignKeysArray: null as unknown as ModelDefinition["foreignKeysArray"], embeddedObject: { a: "users" } } }),
+    ).toEqual(["t: foreignKeysArray must be an object"]);
+    expect(
+      withDefs({ t: { index: "id", foreignKeys: "ab" as unknown as ModelDefinition["foreignKeys"], foreignKeysArray: { "0": { objectType: "users", getter: "getZero" } } } }),
+    ).toEqual(["t: foreignKeys must be an object", 't: foreignKeysArray field "0" is not a valid identifier or is reserved']);
+  });
+
+  test("a non-object definitions map is reported, not thrown on (review 7, finding 6)", () => {
+    for (const bad of [null, undefined, "nope", 42, [] as unknown]) {
+      expect(validateModelDefinitions(bad as unknown as Record<string, ModelDefinition>)).toEqual(["definitions must be an object"]);
+    }
+  });
+
+  test("cascadeDelete must be a boolean (review 7, finding 5)", () => {
+    expect(
+      withDefs({
+        tasks: { index: "id", foreignKeys: { owner_id: { objectType: "users", getter: "getOwner" } } },
+        users: { index: "id", model: "UserModel", relatedObjectType: { tasks: { objectType: "tasks", key: "owner_id", getter: "getTasks", cascadeDelete: "false" as unknown as boolean } } },
+      }),
+    ).toEqual(["users: relatedObjectType.tasks.cascadeDelete must be a boolean"]);
   });
 
   test("newer built-ins and global functions are reserved class names too (review 6, finding 10)", () => {
