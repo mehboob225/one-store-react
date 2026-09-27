@@ -4,7 +4,10 @@ import {
   assertForeignKeyValues,
   assertValidModelDefinitions,
   definitionFor,
+  foreignKeyArrayNames,
   foreignKeyNames,
+  isForeignKeyArrayValue,
+  isForeignKeyValue,
   invalidForeignKeyFields,
   isObjectType,
   objectTypes,
@@ -46,7 +49,19 @@ describe("the real ModelDefinitions", () => {
   test("helpers read the map", () => {
     expect(foreignKeyNames("tasks")).toEqual(["project_id", "assignee_id"]);
     expect(foreignKeyNames("users")).toEqual([]);
+    expect(foreignKeyArrayNames("projects")).toEqual(["member_ids"]);
     expect(definitionFor("task_tags_relation").belongsTo).toEqual(["tasks", "tags"]);
+  });
+
+  test("deleting a task or a tag cascades to its join rows, matching the server (review finding 1)", () => {
+    expect(definitionFor("tasks").relatedObjectType?.task_tags_relation).toEqual({ key: "task_id", getter: "getTagLinks", cascadeDelete: true });
+    expect(definitionFor("tags").relatedObjectType?.task_tags_relation).toEqual({ key: "tag_id", getter: "getTaskLinks", cascadeDelete: true });
+  });
+
+  test("objectTypes is frozen (review finding 9)", () => {
+    expect(Object.isFrozen(objectTypes)).toBe(true);
+    // @ts-expect-error readonly
+    expect(() => objectTypes.push("ghosts")).toThrow();
   });
 });
 
@@ -157,6 +172,70 @@ describe("validateModelDefinitions", () => {
     ]);
   });
 
+  test("field names must be identifiers everywhere they become code or labels (review finding 6)", () => {
+    expect(
+      withDefs({
+        tasks: {
+          index: "id",
+          foreignKeys: { "project/id": { objectType: "projects", getter: "getProject" } },
+          foreignKeysArray: { "watcher ids": { objectType: "users", getter: "getWatchers" } },
+        },
+        comments: { index: "id", foreignKeys: { "task-id": { objectType: "tasks", getter: "getTask" } } },
+        users: { index: "id", model: "UserModel", relatedObjectType: { comments: { key: "task-id", getter: "getComments" } } },
+      }).sort(),
+    ).toEqual(
+      [
+        'tasks: foreignKeys field "project/id" is not a valid identifier',
+        'tasks: foreignKeysArray field "watcher ids" is not a valid identifier',
+        'comments: foreignKeys field "task-id" is not a valid identifier',
+        'users: relatedObjectType.comments.key "task-id" is not a valid identifier',
+        'users: relatedObjectType.comments.key "task-id" points at tasks, not users',
+      ].sort(),
+    );
+  });
+
+  test("a field cannot be both kinds of foreign key; a self-join needs two distinct keys (review finding 7)", () => {
+    expect(
+      withDefs({
+        projects: {
+          index: "id",
+          model: "ProjectModel",
+          foreignKeys: { member_ids: { objectType: "users", getter: "getMember" } },
+          foreignKeysArray: { member_ids: { objectType: "users", getter: "getMembers" } },
+        },
+      }),
+    ).toEqual(['projects: "member_ids" is declared in both foreignKeys and foreignKeysArray']);
+
+    expect(
+      withDefs({
+        users: {
+          index: "id",
+          model: "UserModel",
+          hasMany: { users: { through: "friendships", thisKey: "user_id", otherKey: "user_id", getter: "getFriends" } },
+        },
+        friendships: { index: "id", foreignKeys: { user_id: { objectType: "users", getter: "getUser" } }, belongsTo: ["users"] },
+      }),
+    ).toEqual(['users: hasMany.users: thisKey and otherKey are both "user_id"']);
+  });
+
+  test("an embedded field must not be the index or a foreign-key field (review finding 4)", () => {
+    expect(
+      withDefs({
+        tasks: {
+          index: "id",
+          foreignKeys: { assignee_id: { objectType: "users", getter: "getAssignee" } },
+          foreignKeysArray: { watcher_ids: { objectType: "users", getter: "getWatchers" } },
+          embeddedObject: { assignee_id: "users", id: "users", watcher_ids: "users", "bad name": "users", assignee: "users" },
+        },
+      }),
+    ).toEqual([
+      "tasks: embeddedObject.assignee_id is also declared in foreignKeys",
+      "tasks: embeddedObject.id is the index field",
+      "tasks: embeddedObject.watcher_ids is also declared in foreignKeysArray",
+      'tasks: embeddedObject field "bad name" is not a valid identifier',
+    ]);
+  });
+
   test("index, type names and metaData keys are checked", () => {
     expect(validateModelDefinitions({ "bad-name": { index: "" , metaData: ["ok", "not ok"] } })).toEqual([
       '"bad-name" is not a valid object type name',
@@ -173,17 +252,31 @@ describe("validateModelDefinitions", () => {
 });
 
 describe("foreign-key values", () => {
-  test("scalars and null are fine; booleans, objects, arrays and bigints are not", () => {
+  test("single keys: non-empty strings, finite numbers and null pass; NaN, Infinity, \"\" and non-scalars fail (review findings 2, 3)", () => {
+    for (const ok of [1, 0, -5, "1", "abc", null, undefined]) expect(isForeignKeyValue(ok)).toBe(true);
+    for (const bad of [NaN, Infinity, -Infinity, "", true, false, {}, { id: 1 }, [1], 1n]) expect(isForeignKeyValue(bad)).toBe(false);
+  });
+
+  test("array keys: arrays of non-null scalars pass; anything else fails", () => {
+    for (const ok of [[], [1, 2], ["a", 1], null, undefined]) expect(isForeignKeyArrayValue(ok)).toBe(true);
+    for (const bad of ["1,2", 3, [{ id: 1 }], [1, null], [NaN], [""], {}]) expect(isForeignKeyArrayValue(bad)).toBe(false);
+  });
+
+  test("invalidForeignKeyFields covers both kinds and ignores absent fields", () => {
     expect(invalidForeignKeyFields("tasks", { id: 1, project_id: 1, assignee_id: null })).toEqual([]);
-    expect(invalidForeignKeyFields("tasks", { id: 1, project_id: "1" })).toEqual([]); // absent assignee_id is fine
+    expect(invalidForeignKeyFields("tasks", { id: 1, project_id: "1" })).toEqual([]);
     expect(invalidForeignKeyFields("tasks", { id: 1, project_id: { id: 1 }, assignee_id: true })).toEqual(["project_id", "assignee_id"]);
-    expect(invalidForeignKeyFields("tasks", { id: 1, project_id: [1] })).toEqual(["project_id"]);
-    expect(invalidForeignKeyFields("tasks", { id: 1, project_id: 1n as unknown })).toEqual(["project_id"]);
-    expect(invalidForeignKeyFields("users", { id: 1, anything: { nested: true } })).toEqual([]); // no FKs declared
+    expect(invalidForeignKeyFields("tasks", { id: 1, project_id: NaN })).toEqual(["project_id"]);
+    expect(invalidForeignKeyFields("tasks", { id: 1, project_id: "" })).toEqual(["project_id"]);
+    expect(invalidForeignKeyFields("projects", { id: 1, owner_id: 1, member_ids: [1, 2] })).toEqual([]);
+    expect(invalidForeignKeyFields("projects", { id: 1, member_ids: "1,2" })).toEqual(["member_ids"]);
+    expect(invalidForeignKeyFields("projects", { id: 1, member_ids: [{ id: 1 }] })).toEqual(["member_ids"]);
+    expect(invalidForeignKeyFields("users", { id: 1, anything: { nested: true } })).toEqual([]);
   });
 
   test("assertForeignKeyValues names the fields", () => {
-    expect(() => assertForeignKeyValues("tasks", { id: 1, project_id: false })).toThrow(/tasks record has non-scalar foreign key value\(s\): project_id/);
+    expect(() => assertForeignKeyValues("tasks", { id: 1, project_id: false })).toThrow(/tasks record has invalid foreign key value\(s\): project_id/);
+    expect(() => assertForeignKeyValues("projects", { id: 1, member_ids: 3 })).toThrow(/member_ids/);
     expect(() => assertForeignKeyValues("tasks", { id: 1, project_id: 2 })).not.toThrow();
   });
 });

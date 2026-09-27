@@ -39,7 +39,7 @@ shapes, or the factories (step 11) are the place to adapt.
 | GET | `/users/current` | — | `{user, current_user}` (`current_user` carries `settings`) | — |
 | PUT | `/users/current/settings` | `{settings}` (plain object) | `{current_user}` (settings merged), `400` otherwise | `update current_user` **to that user only** |
 | GET | `/projects` | — | `{projects: []}` (each with `owner_id`, `member_ids`) | — |
-| GET | `/projects/:id` | — | `{project}` | — |
+| GET | `/projects/:id` | — | `{project}` (with `owner_id`, `member_ids`) | — |
 | GET | `/projects/:id/tasks` | — | `{tasks: []}` with embedded `assignee` | — |
 | POST | `/projects/:id/tasks` | `{task: {title, status?, assignee_id?, due_on?}}` | `201 {task}`, `400` on bad values (same rules as `PUT`) | `new task` |
 | POST | `/projects/:id/tasks/import` | — | `{imported: n}` **only a count** | `reload project` |

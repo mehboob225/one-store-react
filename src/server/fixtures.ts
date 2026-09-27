@@ -7,8 +7,10 @@
  * The demo domain exists to exercise every ModelDefinitions property:
  *   users            plain bucket
  *   current_users    the logged-in user + settings
- *   projects         owner_id -> users, relatedObjectType tasks (cascade)
+ *   projects         owner_id -> users, member_ids -> users (foreignKeysArray),
+ *                    relatedObjectType tasks (cascade)
  *   tasks            project_id, assignee_id, embedded assignee, comments, tags
+ *                    (deleting a task also deletes its comments and tag links)
  *   comments         plain rows (no model class)
  *   tags + task_tags many-to-many
  */
