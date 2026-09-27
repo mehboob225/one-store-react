@@ -14,6 +14,11 @@
  *        "tasks/project_id/42"      an object with project_id=42 changed
  *                                   (one per foreign key the caller declares)
  *
+ *    A change that moves an object OUT of a foreign-key bucket (reassigning
+ *    a task, deleting it) must notify the old bucket too. The bus derives
+ *    those keys from `previous`: the object's state before the write. Removes
+ *    must therefore broadcast the stored object, never an id-only stub.
+ *
  *    Keys are collected in a pending map and flushed in a microtask, so a
  *    500-object write produces ONE callback per subscription, carrying the
  *    ids and actions that were batched into it. Nothing here consults the
@@ -29,6 +34,16 @@ export type ListenerErrorHandler = (error: unknown, context: { key?: string }) =
 const defaultErrorHandler: ListenerErrorHandler = (error, context) => {
   console.error(context.key ? `listener for "${context.key}" threw` : "listener threw", error);
 };
+
+/** Reports a listener error; a throwing custom handler must not escape delivery either. */
+function report(handler: ListenerErrorHandler, error: unknown, context: { key?: string }): void {
+  try {
+    handler(error, context);
+  } catch (handlerError) {
+    defaultErrorHandler(error, context);
+    console.error("onListenerError handler threw", handlerError);
+  }
+}
 
 export class EventHandler<T> {
   private readonly listeners = new Set<(payload: T) => void>();
@@ -52,7 +67,7 @@ export class EventHandler<T> {
       try {
         listener(payload);
       } catch (error) {
-        this.onListenerError(error, {});
+        report(this.onListenerError, error, {});
       }
     }
   }
@@ -93,7 +108,19 @@ export type DataEventListener = (batch: DataEventBatch) => void;
 export interface BroadcastInput {
   objectType: string;
   action: DataAction;
+  /**
+   * The objects after the write. For `remove`, pass the stored objects (the
+   * state being deleted), not id-only stubs: their foreign-key values are
+   * what lets the buckets they belonged to hear about the removal.
+   */
   objects: readonly Record<string, unknown>[];
+  /**
+   * The objects' state *before* the write, for updates that may have changed
+   * a declared foreign key (a reassigned task). Each yields the old bucket's
+   * "type/fk/oldValue" key so subscribers to the old bucket are invalidated
+   * too. Matched to `objects` by index value; order does not matter.
+   */
+  previous?: readonly Record<string, unknown>[];
   /** Identity field, from ModelDefinitions[objectType].index. Default "id". */
   index?: string;
   /** Foreign-key field names declared for this type; each yields a "type/fk/value" key. */
@@ -145,22 +172,28 @@ export class DataEventHandler {
    * Records a change. Nothing is delivered synchronously: keys accumulate
    * until the next microtask, then each key's listeners are called once.
    */
-  broadcast({ objectType, action, objects, index = "id", foreignKeys = [] }: BroadcastInput): void {
-    if (objects.length === 0) return;
+  broadcast({ objectType, action, objects, previous = [], index = "id", foreignKeys = [] }: BroadcastInput): void {
+    let enqueued = false;
 
     for (const object of objects) {
       const id = object[index];
       if (!isIndexValue(id)) continue;
+      enqueued = true;
 
       this.enqueue(objectType, objectType, action, id);
       this.enqueue(`${objectType}/${String(id)}`, objectType, action, id);
-      for (const fk of foreignKeys) {
-        const value = object[fk];
-        if (isIndexValue(value)) this.enqueue(`${objectType}/${fk}/${String(value)}`, objectType, action, id);
-      }
+      this.enqueueForeignKeys(objectType, action, id, object, foreignKeys);
     }
 
-    this.scheduleFlush();
+    // Old-bucket keys: an object that left a foreign-key bucket must notify it.
+    for (const object of previous) {
+      const id = object[index];
+      if (!isIndexValue(id)) continue;
+      enqueued = true;
+      this.enqueueForeignKeys(objectType, action, id, object, foreignKeys);
+    }
+
+    if (enqueued) this.scheduleFlush();
   }
 
   /**
@@ -191,7 +224,7 @@ export class DataEventHandler {
         try {
           listener(batch);
         } catch (error) {
-          this.onListenerError(error, { key });
+          report(this.onListenerError, error, { key });
         }
       }
     }
@@ -208,6 +241,19 @@ export class DataEventHandler {
   /** Keys with changes not yet delivered. */
   get pendingKeys(): string[] {
     return [...this.pending.keys()];
+  }
+
+  private enqueueForeignKeys(
+    objectType: string,
+    action: DataAction,
+    id: IndexValue,
+    object: Record<string, unknown>,
+    foreignKeys: readonly string[],
+  ): void {
+    for (const fk of foreignKeys) {
+      const value = object[fk];
+      if (isIndexValue(value)) this.enqueue(`${objectType}/${fk}/${String(value)}`, objectType, action, id);
+    }
   }
 
   private enqueue(key: string, objectType: string, action: DataAction, id: IndexValue): void {

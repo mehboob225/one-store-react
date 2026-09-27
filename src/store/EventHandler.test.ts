@@ -230,9 +230,100 @@ describe("DataEventHandler", () => {
     expect(calls).toEqual(["a", "c"]);
   });
 
+  test("PR #5 review: reassigning a foreign key notifies the OLD bucket too when `previous` is passed", async () => {
+    const bus = new DataEventHandler();
+    const batches: DataEventBatch[] = [];
+    bus.subscribe({ objectType: "tasks", keyName: "assignee_id", key: 1 }, (b) => batches.push(b));
+    bus.subscribe({ objectType: "tasks", keyName: "assignee_id", key: 2 }, (b) => batches.push(b));
+
+    // without previous: only the new bucket hears (the gap the review found)
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7, assignee_id: 2 }], foreignKeys: ["assignee_id"] });
+    await tick();
+    expect(batches.map((b) => b.key)).toEqual(["tasks/assignee_id/2"]);
+
+    // with previous: both buckets hear, each with the object's id and the update action
+    batches.length = 0;
+    bus.broadcast({
+      objectType: "tasks",
+      action: "update",
+      objects: [{ id: 7, assignee_id: 2 }],
+      previous: [{ id: 7, assignee_id: 1 }],
+      foreignKeys: ["assignee_id"],
+    });
+    await tick();
+    expect(batches.map((b) => b.key).sort()).toEqual(["tasks/assignee_id/1", "tasks/assignee_id/2"]);
+    for (const b of batches) expect(b).toMatchObject({ objectType: "tasks", actions: ["update"], ids: [7] });
+  });
+
+  test("PR #5 review: a remove broadcast with the stored object notifies the foreign-key bucket", async () => {
+    const bus = new DataEventHandler();
+    const keys: string[] = [];
+    bus.subscribe({ objectType: "tasks" }, (b) => keys.push(b.key));
+    bus.subscribe({ objectType: "tasks", id: 7 }, (b) => keys.push(b.key));
+    bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => keys.push(b.key));
+
+    // id-only stub (what the server's delete push carries): the project bucket is NOT told
+    bus.broadcast({ objectType: "tasks", action: "remove", objects: [{ id: 7 }], foreignKeys: ["project_id"] });
+    await tick();
+    expect(keys).toEqual(["tasks", "tasks/7"]);
+
+    // the stored copy (what the cache must pass): the project bucket hears the remove
+    keys.length = 0;
+    bus.broadcast({ objectType: "tasks", action: "remove", objects: [{ id: 7, project_id: 42 }], foreignKeys: ["project_id"] });
+    await tick();
+    expect(keys).toEqual(["tasks", "tasks/7", "tasks/project_id/42"]);
+  });
+
+  test("`previous` only adds foreign-key keys; an unchanged FK is deduplicated, and previous alone never adds type/id keys", async () => {
+    const bus = new DataEventHandler();
+    const keys: string[] = [];
+    bus.subscribeKey("tasks", (b) => keys.push(b.key));
+    bus.subscribeKey("tasks/7", (b) => keys.push(b.key));
+    bus.subscribeKey("tasks/project_id/1", (b) => keys.push(`${b.key}:${b.ids.join(",")}`));
+
+    bus.broadcast({
+      objectType: "tasks",
+      action: "update",
+      objects: [{ id: 7, project_id: 1, title: "b" }],
+      previous: [{ id: 7, project_id: 1, title: "a" }],
+      foreignKeys: ["project_id"],
+    });
+    await tick();
+    expect(keys).toEqual(["tasks", "tasks/7", "tasks/project_id/1:7"]); // one delivery, not two
+
+    keys.length = 0;
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [], previous: [{ id: 9, project_id: 1 }], foreignKeys: ["project_id"] });
+    await tick();
+    expect(keys).toEqual(["tasks/project_id/1:9"]); // old bucket only; no "tasks" or "tasks/9"
+  });
+
+  test("a throwing onListenerError handler does not escape delivery", () => {
+    const errors: unknown[] = [];
+    const original = console.error;
+    console.error = (...args: unknown[]) => void errors.push(args);
+    try {
+      const bus = new EventHandler<void>(() => {
+        throw new Error("handler broke");
+      });
+      const seen: string[] = [];
+      bus.subscribe(() => {
+        throw new Error("listener broke");
+      });
+      bus.subscribe(() => seen.push("ok"));
+      expect(() => bus.emit()).not.toThrow();
+      expect(seen).toEqual(["ok"]);
+      expect(errors).toHaveLength(2); // the listener error (fallback) + the handler error
+    } finally {
+      console.error = original;
+    }
+  });
+
   test("empty writes and keys without listeners cost nothing", async () => {
     const bus = new DataEventHandler();
     bus.broadcast({ objectType: "tasks", action: "add", objects: [] });
+    expect(bus.pendingKeys).toEqual([]);
+    // objects without an index value enqueue nothing and schedule nothing
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [{ nope: 1 }] });
     expect(bus.pendingKeys).toEqual([]);
     bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 1 }] });
     await tick();
