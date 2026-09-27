@@ -49,7 +49,7 @@
  *    so batches are always delivered in the order they were queued.
  */
 
-import { canonicalKey, isKeyValue } from "./canonicalKey";
+import { canonicalKey, hasField, isKeyValue, ownField } from "./canonicalKey";
 
 export type Unsubscribe = () => void;
 
@@ -271,7 +271,7 @@ export class DataEventHandler {
     const previousById = input.action === "update" && watchedForeignKeys.length > 0 ? indexById(input.previous, index) : undefined;
 
     for (const object of objects) {
-      const id = ownValue(object, index);
+      const id = ownField(object, index);
       if (!isKeyValue(id)) continue;
       const canon = canonicalKey(id);
 
@@ -371,12 +371,12 @@ export class DataEventHandler {
    * value changed — the bucket it left.
    */
   private enqueueForeignKey(values: Map<string, Target>, objectType: string, fk: string, id: IndexValue, object: Row, before: Row | undefined): void {
-    const present = Object.hasOwn(object, fk);
-    const current = present ? object[fk] : before && ownValue(before, fk);
+    const present = hasField(object, fk); // own and not undefined — the same meaning of "present" as the write guard
+    const current = present ? object[fk] : ownField(before, fk);
     this.enqueueForeignValue(values, objectType, fk, current, id);
 
     // Only a field present in the write can have moved the object out of its old bucket.
-    const old = present && before ? ownValue(before, fk) : undefined;
+    const old = present ? ownField(before, fk) : undefined;
     if (isKeyValue(old) && (!isKeyValue(current) || canonicalKey(old) !== canonicalKey(current))) {
       this.enqueueForeignValue(values, objectType, fk, old, id);
     }
@@ -444,19 +444,10 @@ function getOrCreate(map: Map<string, Target>, key: string, create: boolean): Ta
   return target;
 }
 
-/**
- * Reads a data field as an OWN property only — the one rule for every field
- * the bus reads (index and foreign keys), matching the write guard: data
- * fields are own properties, accessors live on the prototype.
- */
-function ownValue(object: Row, field: string): unknown {
-  return Object.hasOwn(object, field) ? object[field] : undefined;
-}
-
 function indexById(objects: readonly Row[], index: string): Map<string, Row> {
   const map = new Map<string, Row>();
   for (const object of objects) {
-    const id = ownValue(object, index);
+    const id = ownField(object, index);
     if (isKeyValue(id)) map.set(canonicalKey(id), object);
   }
   return map;

@@ -262,23 +262,39 @@ describe("projects and tasks", () => {
     expect(cleared.status).toBe(200);
   });
 
-  test("PUT /tasks/:id answers 404, then 409, then 400 — whatever else the body contains", async () => {
+  test("PUT /tasks/:id decides 404 → 400 malformed → 409 → 400 values, in that order, atomically (docs/API.md)", async () => {
     const put = (id: number, task: unknown) => api(`/tasks/${id}`, { method: "PUT", body: JSON.stringify({ task }) });
-    // unknown task: 404 even with a bad body, a bad assignee, or no hash at all
-    expect((await put(999, { hash: "x", assignee_id: 3 })).status).toBe(404);
-    expect((await put(999, { hash: "x", status: "bogus" })).status).toBe(404);
-    expect((await put(999, {})).status).toBe(404);
-    expect((await put(999, "nope")).status).toBe(404);
-    // stale or missing hash: 409 carrying the current task, even with a bad body or assignee
-    for (const task of [{ hash: "stale", assignee_id: 3 }, { hash: "stale", status: "bogus" }, { status: "bogus" }, {}]) {
+    // 1. unknown task: 404 whatever the body
+    for (const task of [{ hash: "x", assignee_id: 3 }, { hash: "x", status: "bogus" }, {}, "nope", null]) {
+      expect((await put(999, task)).status).toBe(404);
+    }
+    // 2. malformed: no task object, or no string hash — a broken request, never a conflict
+    for (const task of [{}, "nope", null, { hash: 5 }, { status: "done" }]) {
+      const res = await put(1, task);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("string hash");
+    }
+    // 3. stale hash: 409 carrying the current task, even with a bad body or assignee
+    for (const task of [{ hash: "stale", assignee_id: 3 }, { hash: "stale", status: "bogus" }, { hash: "stale" }]) {
       const res = await put(1, task);
       expect(res.status).toBe(409);
       expect(((await res.json()) as { task: { id: number; hash: string } }).task).toMatchObject({ id: 1, hash: "t1-1" });
     }
-    // current hash: only now are the values and the assignee checked
+    // 4. current hash: only now are the values and the assignee checked; nothing was written so far
     expect((await put(1, { hash: "t1-1", status: "bogus" })).status).toBe(400);
     expect((await put(1, { hash: "t1-1", assignee_id: 3 })).status).toBe(400);
+    expect(((await (await api("/tasks/1")).json()) as { task: { hash: string } }).task.hash).toBe("t1-1");
+    // 5. and the write is atomic with the hash check: the same hash cannot be spent twice
     expect((await put(1, { hash: "t1-1", status: "done" })).status).toBe(200);
+    expect((await put(1, { hash: "t1-1", status: "todo" })).status).toBe(409);
+  });
+
+  test("the assignee rule is enforced by the data layer, not only by the routes", () => {
+    expect(mock.db.createTask(1, { title: "x", assignee_id: 3 })).toEqual({ kind: "invalid", error: expect.stringContaining("owner or a project member") });
+    expect(mock.db.createTask(1, { title: "x", assignee_id: 1 }).kind).toBe("created"); // the owner, who need not be in member_ids
+    expect(mock.db.createTask(999, { title: "x" }).kind).toBe("missing");
+    expect(mock.db.isProjectParticipant(1, 3)).toBe(false);
+    expect(mock.db.isProjectParticipant(2, 1)).toBe(true);
   });
 
   test("POST /projects/:id/tasks/import returns only a count", async () => {
@@ -348,9 +364,9 @@ describe("projects and tasks", () => {
     expect(await bad({ title: "" })).toContain("task.title");
     expect(await bad({ assignee_id: "1" })).toContain("task.assignee_id");
     expect(await bad({ due_on: 42 })).toContain("task.due_on");
-    // a missing hash is a conflict (the client does not hold the current one), whatever the body
-    expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: {} }) })).status).toBe(409);
-    expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: "nope" }) })).status).toBe(409);
+    // no string hash = malformed request (400), not a conflict — see the ordering test
+    expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: {} }) })).status).toBe(400);
+    expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: "nope" }) })).status).toBe(400);
 
     // nothing was written: hash unchanged
     const after = ((await (await api("/tasks/1")).json()) as { task: { hash: string } }).task;

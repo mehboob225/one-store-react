@@ -606,6 +606,28 @@ describe("validateModelDefinitions", () => {
     ]);
   });
 
+  test("metaData keys are members too: they may not collide with fields or getters (review 10, finding 9)", () => {
+    expect(
+      withDefs({
+        things: { index: "id", foreignKeys: { owner_id: { objectType: "users", getter: "getOwner" } }, metaData: ["getOwner", "owner_id", "limits"] },
+      }),
+    ).toEqual([
+      'things: member "getOwner" is declared by both foreignKeys.owner_id and metaData',
+      'things: metaData metaData key "owner_id" collides with the data field declared by foreignKeys.owner_id',
+    ]);
+  });
+
+  test("the write guard throws its own clear error for a non-object record (review 10, finding 3)", () => {
+    for (const record of [null, undefined, "row", 42, [1]]) {
+      expect(() => invalidForeignKeyFields("tasks", record as unknown as Record<string, unknown>)).toThrow(/tasks record must be an object/);
+    }
+  });
+
+  test("an own foreign key set to undefined is absent, like a missing one (review 10, finding 4)", () => {
+    expect(invalidForeignKeyFields("tasks", { id: 1, project_id: undefined })).toEqual([]);
+    expect(invalidForeignKeyFields("tasks", { id: 1 })).toEqual([]);
+  });
+
   test("cascadeDelete must be a boolean (review 7, finding 5)", () => {
     expect(
       withDefs({

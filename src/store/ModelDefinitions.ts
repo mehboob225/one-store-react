@@ -43,7 +43,7 @@
  * The exported map is deep-frozen; `definitionFor` returns a readonly view.
  */
 
-import { canonicalKey, isKeyValue } from "./canonicalKey";
+import { hasField, isKeyValue, ownField } from "./canonicalKey";
 
 export interface ForeignKeyDefinition {
   /** The bucket the value points at. */
@@ -294,9 +294,7 @@ const RESERVED_CLASS_NAMES = new Set([
 /** The generator emits `<Model>AppData` base classes, so no model may take that suffix itself. */
 const GENERATED_SUFFIX = "AppData";
 
-function isReservedClassName(name: string): boolean {
-  return RESERVED_CLASS_NAMES.has(name);
-}
+
 
 /**
  * Valid identifier that the generator may emit as a data field, join key or
@@ -346,8 +344,9 @@ function checkEntry(ctx: TypeContext, label: string, entry: unknown): entry is R
 }
 
 /** Own-property lookup: a field named "constructor" or "toString" must not resolve to Object.prototype. */
+/** Schema records are read with the same own-property rule as data fields (arrays are not records). */
 function own<T>(record: Record<string, T> | null | undefined, key: string): T | undefined {
-  return isRecord(record) && Object.hasOwn(record, key) ? (record as Record<string, T>)[key] : undefined;
+  return Array.isArray(record) ? undefined : ownField(record, key);
 }
 
 /** The own keys of a record, or none when the value is not a record (null, a string, …). */
@@ -447,7 +446,7 @@ function collectFields(ctx: TypeContext): void {
  * identifier, must not collide with a data field of the same class, and must
  * be unique among the type's members.
  */
-function claimMember(ctx: TypeContext, kind: "getter" | "relation name", name: unknown, owner: string): void {
+function claimMember(ctx: TypeContext, kind: "getter" | "relation name" | "metaData key", name: unknown, owner: string): void {
   if (typeof name !== "string") {
     problem(ctx, `${owner} ${kind} is missing or not a string`);
     return;
@@ -477,7 +476,7 @@ function checkModel(ctx: TypeContext): void {
     return;
   }
   if (!IDENTIFIER.test(model)) problem(ctx, `model "${model}" is not a valid identifier`);
-  else if (isReservedClassName(model)) problem(ctx, `model "${model}" is a reserved name`);
+  else if (RESERVED_CLASS_NAMES.has(model)) problem(ctx, `model "${model}" is a reserved name`);
   else if (model.endsWith(GENERATED_SUFFIX)) problem(ctx, `model "${model}" ends with "${GENERATED_SUFFIX}", the suffix of generated base classes`);
   const owner = ctx.models.get(model);
   if (owner) problem(ctx, `model "${model}" is also used by ${owner}`);
@@ -627,9 +626,14 @@ function checkMetaData(ctx: TypeContext): void {
   }
   const seen = new Set<string>();
   for (const key of metaData) {
-    if (typeof key !== "string" || !isEmittable(key)) problem(ctx, `metaData key "${String(key)}" is not a valid identifier or is reserved`);
-    else if (seen.has(key)) problem(ctx, `metaData lists "${key}" twice`);
-    else seen.add(key);
+    if (typeof key !== "string" || !isEmittable(key)) {
+      problem(ctx, `metaData key "${String(key)}" is not a valid identifier or is reserved`);
+    } else if (seen.has(key)) {
+      problem(ctx, `metaData lists "${key}" twice`);
+    } else {
+      seen.add(key);
+      claimMember(ctx, "metaData key", key, "metaData"); // the generator emits an accessor per key
+    }
   }
 }
 
@@ -698,14 +702,16 @@ export function invalidForeignKeyFields(objectType: ObjectType, record: Record<s
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): readonly string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): readonly string[] {
   const facts = factsOf(objectType, definitions);
+  if (!isRecord(record)) throw new TypeError(`${objectType} record must be an object`);
   // no closure and no array on the clean path: `bad` is created by the first problem
   let bad: string[] | undefined;
-  if (!isKeyValue(own(record, facts.index))) bad = [facts.index];
+  if (!isKeyValue(ownField(record, facts.index))) bad = [facts.index];
+  // `hasField`: an own field set to undefined is absent (partial update), like the event bus
   for (const field of facts.foreignKeys) {
-    if (Object.hasOwn(record, field) && !isForeignKeyValue(record[field])) bad = addUnique(bad, field);
+    if (hasField(record, field) && !isForeignKeyValue(record[field])) bad = addUnique(bad, field);
   }
   for (const field of facts.foreignKeyArrays) {
-    if (Object.hasOwn(record, field) && !isForeignKeyArrayValue(record[field])) bad = addUnique(bad, field);
+    if (hasField(record, field) && !isForeignKeyArrayValue(record[field])) bad = addUnique(bad, field);
   }
   return bad ?? NO_BAD_FIELDS;
 }

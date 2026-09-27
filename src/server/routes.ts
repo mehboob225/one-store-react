@@ -11,8 +11,7 @@
  */
 import type { BunRequest } from "bun";
 import type { Database } from "./db";
-import type { ProjectRow } from "./fixtures";
-import { isPlainObject, validateCredentials, validateNewTask, validateSettings, validateTaskPatch } from "./validation";
+import { validateCredentials, validateNewTask, validateSettings, validateTaskPatch } from "./validation";
 import { unauthorized, type Sessions } from "./auth";
 import type { PushHub } from "./push";
 
@@ -37,17 +36,6 @@ async function json<T>(req: Request): Promise<T | undefined> {
 
 export function createRoutes(ctx: RouteContext) {
   const { db, sessions, push } = ctx;
-  /**
-   * An assignee is optional, but when given it must be the project's owner or
-   * a member: then `assignee_id` always resolves, and a project's members
-   * (`getMembers()`) always include its assignees. Returns the 400 to send,
-   * or undefined when the assignee is acceptable.
-   */
-  const assigneeProblem = (project: ProjectRow, assigneeId: number | null | undefined): Response | undefined => {
-    if (assigneeId == null) return undefined;
-    if (project.owner_id === assigneeId || project.member_ids.includes(assigneeId)) return undefined;
-    return badRequest("task.assignee_id must be the project owner or a project member");
-  };
 
   /** Wraps a handler so it runs only for authenticated requests. */
   function authed<P extends string>(
@@ -131,14 +119,14 @@ export function createRoutes(ctx: RouteContext) {
       }),
       POST: authed<"/api/v1/projects/:id/tasks">(async (req) => {
         const projectId = Number(req.params.id);
-        const project = db.getProject(projectId);
-        if (!project) return notFound("project");
+        if (!db.getProject(projectId)) return notFound("project");
         const body = await json<{ task?: unknown }>(req);
         const input = validateNewTask(body?.task);
         if (!input.ok) return badRequest(input.error);
-        const rejected = assigneeProblem(project, input.value.assignee_id);
-        if (rejected) return rejected;
-        const task = db.withAssignee(db.createTask(projectId, input.value));
+        const outcome = db.createTask(projectId, input.value); // the assignee rule lives in the db
+        if (outcome.kind === "missing") return notFound("project");
+        if (outcome.kind === "invalid") return badRequest(outcome.error);
+        const task = db.withAssignee(outcome.task);
         push.broadcast({ type: "new", objectType: "task", data: task });
         return Response.json({ task }, { status: 201 });
       }),
@@ -170,26 +158,27 @@ export function createRoutes(ctx: RouteContext) {
       PUT: authed<"/api/v1/tasks/:id">(async (req) => {
         const id = Number(req.params.id);
         const body = await json<{ task?: unknown }>(req);
-        // Order: 404, then 409, then 400. Only the hash is needed to decide the first two, and
-        // the 409 carries the current task the client needs to recover — so it must not be
-        // hidden behind body validation. A missing hash is a conflict too: the client does
-        // not hold the current one.
-        const requestedHash = isPlainObject(body?.task) ? body.task.hash : undefined;
-        const lookup = db.findTaskForUpdate(id, requestedHash);
-        if (lookup.kind === "missing") return notFound("task");
-        if (lookup.kind === "conflict") {
-          return Response.json({ error: "conflict", task: db.withAssignee(lookup.current) }, { status: 409 });
+        // The db decides everything in one atomic step, in the documented order
+        // (docs/API.md): 404, 400 malformed, 409 with the current task, 400 bad values.
+        const outcome = db.updateTask(id, body?.task, (task) => {
+          const patch = validateTaskPatch(task);
+          return patch.ok ? { ok: true, patch: patch.value } : patch;
+        });
+        switch (outcome.kind) {
+          case "missing":
+            return notFound("task");
+          case "malformed":
+            return badRequest("task must be an object with a string hash");
+          case "conflict":
+            return Response.json({ error: "conflict", task: db.withAssignee(outcome.current) }, { status: 409 });
+          case "invalid":
+            return badRequest(outcome.error);
+          case "updated": {
+            const task = db.withAssignee(outcome.task);
+            push.broadcast({ type: "update", objectType: "task", data: task });
+            return Response.json({ task });
+          }
         }
-        const patch = validateTaskPatch(body?.task);
-        if (!patch.ok) return badRequest(patch.error);
-        const project = db.getProject(lookup.current.project_id);
-        if (!project) return notFound("project");
-        const rejected = assigneeProblem(project, patch.value.assignee_id);
-        if (rejected) return rejected;
-
-        const task = db.withAssignee(db.applyTaskPatch(id, patch.value));
-        push.broadcast({ type: "update", objectType: "task", data: task });
-        return Response.json({ task });
       }),
       DELETE: authed<"/api/v1/tasks/:id">((req) => {
         const id = Number(req.params.id);

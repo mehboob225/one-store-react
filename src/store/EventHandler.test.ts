@@ -285,6 +285,21 @@ describe("DataEventHandler", () => {
       expect(ids).toEqual([8, 9]); // an accessor defined on the object itself is an own property; an inherited id is not
     });
 
+    test("an own foreign key set to undefined is absent, like the write guard says: the object stays in its bucket (review 10, finding 4)", async () => {
+      const bus = new DataEventHandler();
+      const keys: string[] = [];
+      bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => keys.push(`${b.key}:${b.ids.join(",")}`));
+      bus.broadcast({
+        objectType: "tasks",
+        action: "update",
+        objects: [{ id: 7, project_id: undefined, title: "x" }],
+        previous: [{ id: 7, project_id: 42 }],
+        foreignKeys: ["project_id"],
+      });
+      await tick();
+      expect(keys).toEqual(["tasks/project_id/42:7"]); // one notification, from the bucket it is still in
+    });
+
     test("`previous` entries whose id is not in `objects` are ignored", async () => {
       const bus = new DataEventHandler();
       const batches: DataEventBatch[] = [];

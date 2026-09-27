@@ -14,7 +14,7 @@ import {
   type TaskTagRow,
   type UserRow,
 } from "./fixtures";
-import { MUTABLE_TASK_FIELDS, type MutableTaskField } from "./validation";
+import { MUTABLE_TASK_FIELDS, isPlainObject, type MutableTaskField } from "./validation";
 
 /** What other users may see: id and name only — never email, password or settings. */
 export type PublicUser = Pick<UserRow, "id" | "name">;
@@ -31,8 +31,24 @@ export interface NewTask {
 
 export type TaskPatch = Partial<Omit<TaskRow, "id" | "project_id" | "hash">> & { hash: string };
 
-/** Result of looking a task up for an update: the route maps each case to 404, 409 or a write. */
-export type TaskLookup = { kind: "missing" } | { kind: "conflict"; current: TaskRow } | { kind: "ok"; current: TaskRow };
+/** The caller's validation of an update body, run by `updateTask` after the hash check. */
+export type TaskPatchValidation = { ok: true; patch: Omit<TaskPatch, "hash"> } | { ok: false; error: string };
+
+/** Outcome of `createTask`. */
+export type CreateOutcome = { kind: "missing" } | { kind: "invalid"; error: string } | { kind: "created"; task: TaskRow };
+
+/**
+ * Outcome of `updateTask`, in the order the checks run — the route maps each
+ * to a status: missing → 404, malformed → 400, conflict → 409, invalid → 400.
+ */
+export type UpdateOutcome =
+  | { kind: "missing" }
+  | { kind: "malformed" }
+  | { kind: "conflict"; current: TaskRow }
+  | { kind: "invalid"; error: string }
+  | { kind: "updated"; task: TaskRow };
+
+const ASSIGNEE_RULE = "task.assignee_id must be the project owner or a project member";
 
 export class Database {
   private data: SeedData;
@@ -117,7 +133,26 @@ export class Database {
     return task ? clone(task) : undefined;
   }
 
-  createTask(projectId: number, input: NewTask): TaskRow {
+  /**
+   * Whether `userId` may be assigned work in `projectId`: the project's owner
+   * or one of its members. The owner need not appear in `member_ids`, so a
+   * project's `getMembers()` is not guaranteed to list every assignee — the
+   * owner is the one exception.
+   */
+  isProjectParticipant(projectId: number, userId: number): boolean {
+    const project = this.data.projects.find((p) => p.id === projectId);
+    return project !== undefined && (project.owner_id === userId || project.member_ids.includes(userId));
+  }
+
+  /**
+   * Creates a task. The assignee rule is enforced here, next to the write,
+   * so every writer (routes, imports, tests) gets it.
+   */
+  createTask(projectId: number, input: NewTask): CreateOutcome {
+    if (!this.data.projects.some((p) => p.id === projectId)) return { kind: "missing" };
+    if (input.assignee_id != null && !this.isProjectParticipant(projectId, input.assignee_id)) {
+      return { kind: "invalid", error: ASSIGNEE_RULE };
+    }
     const id = this.nextId.tasks++;
     const task: TaskRow = {
       id,
@@ -129,34 +164,38 @@ export class Database {
       hash: `t${id}-1`,
     };
     this.data.tasks.push(task);
-    return clone(task);
+    return { kind: "created", task: clone(task) };
   }
 
   /**
-   * The first step of an update: is the task there, and does the caller hold
-   * its current hash? Only the hash is needed to answer, so a route can send
-   * 404 or 409 (with the current row) before it validates anything else.
-   */
-  findTaskForUpdate(id: number, hash: unknown): TaskLookup {
-    const task = this.data.tasks.find((t) => t.id === id);
-    if (!task) return { kind: "missing" };
-    if (hash !== task.hash) return { kind: "conflict", current: clone(task) };
-    return { kind: "ok", current: clone(task) };
-  }
-
-  /**
-   * The second step: applies the mutable fields (see MUTABLE_TASK_FIELDS) to
-   * a task whose hash was verified by `findTaskForUpdate` and bumps the hash.
+   * Updates a task in ONE synchronous step — optimistic locking depends on
+   * nothing happening between the hash check and the write:
+   *   1. the task must exist                                → missing
+   *   2. `body` must be an object with a string `hash`     → malformed
+   *   3. the hash must be the current one                   → conflict (with the current row)
+   *   4. `validate(body)` must accept the field values,
+   *      and an assignee must be an owner or member         → invalid
+   *   5. the mutable fields are applied and the hash bumped → updated
    * `id`, `project_id` and `hash` can never be set by a caller.
    */
-  applyTaskPatch(id: number, patch: Omit<TaskPatch, "hash">): TaskRow {
+  updateTask(id: number, body: unknown, validate: (body: Record<string, unknown>) => TaskPatchValidation): UpdateOutcome {
     const task = this.data.tasks.find((t) => t.id === id);
-    if (!task) throw new Error(`applyTaskPatch: task ${id} vanished between lookup and write`);
+    if (!task) return { kind: "missing" };
+    if (!isPlainObject(body) || typeof body.hash !== "string") return { kind: "malformed" };
+    if (body.hash !== task.hash) return { kind: "conflict", current: clone(task) };
+
+    const validated = validate(body);
+    if (!validated.ok) return { kind: "invalid", error: validated.error };
+    const { patch } = validated;
+    if (patch.assignee_id != null && !this.isProjectParticipant(task.project_id, patch.assignee_id)) {
+      return { kind: "invalid", error: ASSIGNEE_RULE };
+    }
+
     for (const field of MUTABLE_TASK_FIELDS) {
       if (field in patch) (task as Record<MutableTaskField, unknown>)[field] = patch[field];
     }
     task.hash = bumpHash(task.hash);
-    return clone(task);
+    return { kind: "updated", task: clone(task) };
   }
 
   /** Removes the task and its comments + tag links. Returns what was removed. */
