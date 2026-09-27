@@ -12,7 +12,8 @@ Each step is one PR; every PR must keep `bun run check`, `bun test` and
 
 ## Scripts
 
-- `bun dev` — hot-reloading dev server (`src/index.ts` serves `src/index.html`)
+- `bun dev` — hot-reloading dev server (`src/index.ts` serves `src/index.html` and the
+  in-memory mock backend from `src/server/`; contract in `docs/API.md`)
 - `bun run check` — `tsc --noEmit`
 - `bun test` — unit + component tests (happy-dom is preloaded via `test/setup.ts`)
 - `bun run build` — static production build to `dist/`
