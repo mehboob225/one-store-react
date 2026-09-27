@@ -5,6 +5,9 @@
  * It is included in `src/index.html`.
  */
 
+// Side-effect import: resolve backend endpoints before anything touches the network.
+import "./config/DomainConfiguration";
+
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";

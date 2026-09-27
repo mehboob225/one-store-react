@@ -27,6 +27,8 @@ const native = {
   queueMicrotask,
 };
 
-GlobalRegistrator.register();
+// A fixed origin so code that reads window.location (DomainConfiguration,
+// routing) resolves deterministically.
+GlobalRegistrator.register({ url: "http://localhost:3000/" });
 
 Object.assign(globalThis, native);
