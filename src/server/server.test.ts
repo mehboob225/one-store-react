@@ -53,6 +53,15 @@ describe("auth", () => {
     expect(body.user as Record<string, unknown>).not.toHaveProperty("password");
   });
 
+  test("sign_in rejects non-string or missing credentials with 400", async () => {
+    const post = (body: unknown) =>
+      fetch(`${base}/api/v1/sign_in`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    for (const body of [{}, { email: 1, password: "password" }, { email: "ada@example.com", password: ["p"] }, "ada", null]) {
+      expect((await post(body)).status).toBe(400);
+    }
+    expect((await post({ email: "", password: "password" })).status).toBe(400);
+  });
+
   test("wrong password is 401", async () => {
     expect((await signIn("ada@example.com", "nope")).status).toBe(401);
   });
@@ -92,6 +101,24 @@ describe("users", () => {
     });
     const body = (await res.json()) as { current_user: { settings: Record<string, unknown> } };
     expect(body.current_user.settings).toEqual({ theme: "dark", sidebar: "collapsed" });
+  });
+
+  test("PUT /users/current/settings rejects non-object settings without writing (review 2, finding 3)", async () => {
+    const headers = await authHeader();
+    const before = ((await (await api("/users/current", {}, headers)).json()) as { current_user: { settings: unknown } })
+      .current_user.settings;
+
+    for (const settings of ["dark", ["dark"], true, 42, null]) {
+      const res = await api("/users/current/settings", { method: "PUT", body: JSON.stringify({ settings }) }, headers);
+      expect(res.status).toBe(400);
+      expect(((await res.json()) as { error: string }).error).toContain("settings");
+    }
+    expect((await api("/users/current/settings", { method: "PUT", body: JSON.stringify({}) }, headers)).status).toBe(400);
+
+    const after = ((await (await api("/users/current", {}, headers)).json()) as { current_user: { settings: unknown } })
+      .current_user.settings;
+    expect(after).toEqual(before);
+    expect(after).toEqual({ theme: "dark" });
   });
 
   test("public user representations never include settings (finding 4)", async () => {
@@ -188,6 +215,39 @@ describe("projects and tasks", () => {
     const body = await (await api("/projects/2/tasks/import", { method: "POST" })).json();
     expect(body).toEqual({ imported: 3 });
     expect(((await (await api("/projects/2/tasks")).json()) as { tasks: unknown[] }).tasks).toHaveLength(6);
+  });
+
+  test("POST /projects/:id/tasks validates like PUT and persists nothing on failure (review 2, finding 2)", async () => {
+    const headers = await authHeader();
+    const count = async () =>
+      (((await (await api("/projects/1/tasks", {}, headers)).json()) as { tasks: unknown[] }).tasks).length;
+    const before = await count();
+
+    const bad = async (task: unknown) => {
+      const res = await api("/projects/1/tasks", { method: "POST", body: JSON.stringify({ task }) }, headers);
+      expect(res.status).toBe(400);
+      return ((await res.json()) as { error: string }).error;
+    };
+    expect(await bad({ title: { bad: true } })).toContain("task.title");
+    expect(await bad({ title: "   " })).toContain("task.title");
+    expect(await bad({})).toContain("task.title");
+    expect(await bad({ title: "ok", status: "archived" })).toContain("task.status");
+    expect(await bad({ title: "ok", assignee_id: "1" })).toContain("task.assignee_id");
+    expect(await bad({ title: "ok", due_on: 42 })).toContain("task.due_on");
+    expect(await bad("just a string")).toContain("task");
+    expect(await bad(null)).toContain("task");
+    expect(await count()).toBe(before);
+
+    // server-owned and unknown fields are dropped on create too
+    const res = await api(
+      "/projects/1/tasks",
+      { method: "POST", body: JSON.stringify({ task: { title: "Clean", id: 999, project_id: 2, hash: "x", bogus: 1, status: "doing" } }) },
+      headers,
+    );
+    expect(res.status).toBe(201);
+    const { task } = (await res.json()) as { task: Record<string, unknown> };
+    expect(task).toMatchObject({ id: 7, project_id: 1, hash: "t7-1", title: "Clean", status: "doing" });
+    expect(task).not.toHaveProperty("bogus");
   });
 
   test("PUT /tasks/:id ignores immutable and unknown fields (finding 1)", async () => {
@@ -357,5 +417,43 @@ describe("push", () => {
     expect(leaked).toBe("none");
 
     for (const c of [tab1, tab2, graceSocket]) c.ws.close();
+  });
+
+  test("malformed frames are ignored and the socket keeps working (review 2, finding 4)", async () => {
+    const headers = await authHeader();
+    const [uuid, token] = headers.authorization!.split(":");
+    const { ws, next } = connect();
+    await open(ws);
+
+    for (const frame of ["null", "42", '"login"', "[]", "[1,2]", "{not json", "", '{"type":null}', '{"type":"nope"}']) {
+      ws.send(frame);
+    }
+    // give the server a tick to process them all; nothing should have been sent back except possibly a ping
+    await new Promise((r) => setTimeout(r, 30));
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    expect(mock.push.clientCount).toBe(0);
+
+    ws.send(JSON.stringify({ type: "login", uuid, token }));
+    expect((await next("login_ok")).type).toBe("login_ok");
+    expect(mock.push.clientCount).toBe(1);
+    ws.close();
+  });
+
+  test("rejected writes emit no push messages", async () => {
+    const headers = await authHeader();
+    const socket = await loggedIn(headers);
+
+    await api("/projects/1/tasks", { method: "POST", body: JSON.stringify({ task: { title: "" } }) }, headers);
+    await api("/users/current/settings", { method: "PUT", body: JSON.stringify({ settings: "dark" }) }, headers);
+    const { hash } = ((await (await api("/tasks/1", {}, headers)).json()) as { task: { hash: string } }).task;
+    await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash, status: "archived" } }) }, headers);
+
+    const quiet = await Promise.race([
+      socket.next("new"),
+      socket.next("update"),
+      new Promise<"none">((r) => setTimeout(() => r("none"), 100)),
+    ]);
+    expect(quiet).toBe("none");
+    socket.ws.close();
   });
 });

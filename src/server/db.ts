@@ -14,6 +14,7 @@ import {
   type TaskTagRow,
   type UserRow,
 } from "./fixtures";
+import { MUTABLE_TASK_FIELDS, type MutableTaskField } from "./validation";
 
 /** What other users may see: no password, no settings. */
 export type PublicUser = Omit<UserRow, "password" | "settings">;
@@ -29,45 +30,6 @@ export interface NewTask {
 }
 
 export type TaskPatch = Partial<Omit<TaskRow, "id" | "project_id" | "hash">> & { hash: string };
-
-export const TASK_STATUSES: readonly TaskRow["status"][] = ["todo", "doing", "done"];
-
-/** The only task fields a client may change. `id`, `project_id`, `hash` are server-owned. */
-const MUTABLE_TASK_FIELDS = ["title", "status", "assignee_id", "due_on"] as const;
-type MutableTaskField = (typeof MUTABLE_TASK_FIELDS)[number];
-
-/**
- * Validates an untrusted patch body. Unknown and immutable fields are
- * dropped; badly typed values are reported.
- */
-export function sanitizeTaskPatch(input: unknown): { patch: TaskPatch } | { error: string } {
-  if (typeof input !== "object" || input === null) return { error: "task must be an object" };
-  const body = input as Record<string, unknown>;
-  if (typeof body.hash !== "string") return { error: "task.hash is required" };
-
-  const patch: TaskPatch = { hash: body.hash };
-  for (const field of MUTABLE_TASK_FIELDS) {
-    if (!(field in body)) continue;
-    const value = body[field];
-    const problem = validateTaskField(field, value);
-    if (problem) return { error: problem };
-    (patch as Record<MutableTaskField, unknown>)[field] = value;
-  }
-  return { patch };
-}
-
-function validateTaskField(field: MutableTaskField, value: unknown): string | undefined {
-  switch (field) {
-    case "title":
-      return typeof value === "string" && value.trim() !== "" ? undefined : "task.title must be a non-empty string";
-    case "status":
-      return TASK_STATUSES.includes(value as TaskRow["status"]) ? undefined : `task.status must be one of ${TASK_STATUSES.join(", ")}`;
-    case "assignee_id":
-      return value === null || typeof value === "number" ? undefined : "task.assignee_id must be a number or null";
-    case "due_on":
-      return value === null || typeof value === "string" ? undefined : "task.due_on must be a string or null";
-  }
-}
 
 export class ConflictError extends Error {
   constructor(public readonly current: TaskRow) {

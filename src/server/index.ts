@@ -10,11 +10,31 @@ import { Database } from "./db";
 import { PushHub, type PushHubOptions, type SocketData } from "./push";
 import { createRoutes } from "./routes";
 
+/** The stateful half of the backend: data, sessions and connected sockets. */
+export interface BackendState {
+  db: Database;
+  sessions: Sessions;
+  push: PushHub;
+}
+
+export function createBackendState(options: PushHubOptions = {}): BackendState {
+  const db = new Database();
+  const sessions = new Sessions(db);
+  const push = new PushHub(sessions, options);
+  return { db, sessions, push };
+}
+
 export interface MockServerOptions extends PushHubOptions {
   port?: number;
   /** Extra routes, e.g. `{ "/*": index }` for the HTML entry. */
   routes?: Record<string, unknown>;
   development?: Parameters<typeof serve>[0]["development"];
+  /**
+   * Reuse existing state instead of creating fresh state. The dev entry
+   * passes state kept in `import.meta.hot.data` so a hot reload swaps the
+   * handlers but keeps data, sessions and open sockets.
+   */
+  state?: BackendState;
 }
 
 export interface MockServer {
@@ -29,9 +49,8 @@ export interface MockServer {
 }
 
 export function createMockServer(options: MockServerOptions = {}): MockServer {
-  const db = new Database();
-  const sessions = new Sessions(db);
-  const push = new PushHub(sessions, { pingIntervalMs: options.pingIntervalMs });
+  const ownsState = options.state === undefined;
+  const { db, sessions, push } = options.state ?? createBackendState({ pingIntervalMs: options.pingIntervalMs });
 
   const server = serve<SocketData>({
     port: options.port ?? 0,
@@ -62,7 +81,8 @@ export function createMockServer(options: MockServerOptions = {}): MockServer {
       sessions.clear();
     },
     async stop() {
-      push.stop();
+      // Shared state outlives any one server; only stop what we created.
+      if (ownsState) push.stop();
       await server.stop(true);
     },
   };

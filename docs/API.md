@@ -20,7 +20,7 @@ shapes, or the factories (step 11) are the place to adapt.
 | User representations | public users (`user`, `assignee`) carry `id`, `name`, `email` only; `current_user` additionally carries `settings` and is only ever sent to that user |
 | Deletions | mutations may include `deleted_<bucket>: [ids]`; the client removes those ids |
 | Optimistic locking | `tasks` carry a `hash`; `PUT` must send the current one or gets `409 {"error":"conflict", task}` |
-| Validation | `PUT /tasks/:id` accepts only `title`, `status`, `assignee_id`, `due_on`; other fields are ignored, bad values are `400 {"error"}` |
+| Validation | every write body is validated (`src/server/validation.ts`): unknown and server-owned fields are dropped, badly typed values return `400 {"error"}` and nothing is written or broadcast |
 | Push | every mutation broadcasts on the WebSocket (see below) |
 
 ## Fixture accounts
@@ -34,14 +34,14 @@ shapes, or the factories (step 11) are the place to adapt.
 
 | Method | Path | Body | Response | Push |
 |---|---|---|---|---|
-| POST | `/sign_in` | `{email, password}` | `{uuid, token, user}` | — |
+| POST | `/sign_in` | `{email, password}` (non-empty strings) | `{uuid, token, user}`, `400` on a bad body | — |
 | DELETE | `/sign_out` | — | `{ok: true}`; that session's sockets get `session_invalid` and close | — |
 | GET | `/users/current` | — | `{user, current_user}` (`current_user` carries `settings`) | — |
-| PUT | `/users/current/settings` | `{settings}` | `{current_user}` (settings merged) | `update current_user` **to that user only** |
+| PUT | `/users/current/settings` | `{settings}` (plain object) | `{current_user}` (settings merged), `400` otherwise | `update current_user` **to that user only** |
 | GET | `/projects` | — | `{projects: []}` | — |
 | GET | `/projects/:id` | — | `{project}` | — |
 | GET | `/projects/:id/tasks` | — | `{tasks: []}` with embedded `assignee` | — |
-| POST | `/projects/:id/tasks` | `{task: {title, status?, assignee_id?, due_on?}}` | `201 {task}` | `new task` |
+| POST | `/projects/:id/tasks` | `{task: {title, status?, assignee_id?, due_on?}}` | `201 {task}`, `400` on bad values (same rules as `PUT`) | `new task` |
 | POST | `/projects/:id/tasks/import` | — | `{imported: n}` **only a count** | `reload project` |
 | GET | `/tasks/:id` | — | `{task}` with embedded `assignee` | — |
 | PUT | `/tasks/:id` | `{task: {hash, title?, status?, assignee_id?, due_on?}}` | `{task}` with new `hash`, `400` on bad values, or `409` | `update task` |
@@ -68,8 +68,16 @@ Endpoint: `ws://<host>/push`. Messages are JSON.
 | server → client | `{type:"reload", objectType, objectId}` | scope changed beyond any payload; clear loaders and refetch |
 
 `objectType` is the singular entity name (`task`, `project`, `current_user`).
-Unauthenticated sockets receive nothing. Entity changes are broadcast to every
+Unauthenticated sockets receive nothing. Frames that are not a JSON object
+(`null`, numbers, strings, arrays, invalid JSON) are ignored; unknown `type`s too. Entity changes are broadcast to every
 authenticated socket; `current_user` updates go only to that user's sockets.
+
+## Development notes
+
+Under `bun dev` (`bun --hot`) the backend state (data, sessions, open sockets)
+is kept on `globalThis` by `src/server/dev.ts`, so saving a server file swaps
+the handlers but keeps you signed in, keeps your data, and keeps existing
+WebSockets receiving events. Restart the process to reset to the seed data.
 
 ## curl walkthrough
 

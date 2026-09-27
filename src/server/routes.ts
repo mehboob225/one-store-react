@@ -10,7 +10,8 @@
  *   - every mutation broadcasts a push message
  */
 import type { BunRequest } from "bun";
-import { ConflictError, sanitizeTaskPatch, type Database, type NewTask } from "./db";
+import { ConflictError, type Database } from "./db";
+import { validateCredentials, validateNewTask, validateSettings, validateTaskPatch } from "./validation";
 import { unauthorized, type Sessions } from "./auth";
 import type { PushHub } from "./push";
 
@@ -52,9 +53,9 @@ export function createRoutes(ctx: RouteContext) {
 
     "/api/v1/sign_in": {
       POST: async (req: BunRequest<"/api/v1/sign_in">) => {
-        const body = await json<{ email?: string; password?: string }>(req);
-        if (!body?.email || !body.password) return badRequest("email and password are required");
-        const result = sessions.signIn(body.email, body.password);
+        const body = validateCredentials(await json(req));
+        if (!body.ok) return badRequest(body.error);
+        const result = sessions.signIn(body.value.email, body.value.password);
         if (!result) return unauthorized();
         return Response.json({ uuid: result.session.uuid, token: result.session.token, user: result.user });
       },
@@ -81,9 +82,10 @@ export function createRoutes(ctx: RouteContext) {
 
     "/api/v1/users/current/settings": {
       PUT: authed<"/api/v1/users/current/settings">(async (req, userId) => {
-        const body = await json<{ settings?: Record<string, unknown> }>(req);
-        if (!body?.settings) return badRequest("settings is required");
-        const user = db.updateUserSettings(userId, body.settings);
+        const body = await json<{ settings?: unknown }>(req);
+        const settings = validateSettings(body?.settings);
+        if (!settings.ok) return badRequest(settings.error);
+        const user = db.updateUserSettings(userId, settings.value);
         if (!user) return notFound("user");
         // Personal data: only this user's other sessions/tabs should hear about it.
         push.sendToUser(userId, { type: "update", objectType: "current_user", data: user });
@@ -114,9 +116,10 @@ export function createRoutes(ctx: RouteContext) {
       POST: authed<"/api/v1/projects/:id/tasks">(async (req) => {
         const projectId = Number(req.params.id);
         if (!db.getProject(projectId)) return notFound("project");
-        const body = await json<{ task?: NewTask }>(req);
-        if (!body?.task?.title) return badRequest("task.title is required");
-        const task = db.withAssignee(db.createTask(projectId, body.task));
+        const body = await json<{ task?: unknown }>(req);
+        const input = validateNewTask(body?.task);
+        if (!input.ok) return badRequest(input.error);
+        const task = db.withAssignee(db.createTask(projectId, input.value));
         push.broadcast({ type: "new", objectType: "task", data: task });
         return Response.json({ task }, { status: 201 });
       }),
@@ -148,10 +151,10 @@ export function createRoutes(ctx: RouteContext) {
       PUT: authed<"/api/v1/tasks/:id">(async (req) => {
         const id = Number(req.params.id);
         const body = await json<{ task?: unknown }>(req);
-        const sanitized = sanitizeTaskPatch(body?.task);
-        if ("error" in sanitized) return badRequest(sanitized.error);
+        const patch = validateTaskPatch(body?.task);
+        if (!patch.ok) return badRequest(patch.error);
         try {
-          const task = db.updateTask(id, sanitized.patch);
+          const task = db.updateTask(id, patch.value);
           if (!task) return notFound("task");
           const withAssignee = db.withAssignee(task);
           push.broadcast({ type: "update", objectType: "task", data: withAssignee });

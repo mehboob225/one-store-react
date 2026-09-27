@@ -1,7 +1,7 @@
 import index from "./index.html";
-import { createMockServer } from "./server";
+import { startMockServer } from "./server/dev";
 
-const { url } = createMockServer({
+const { url } = startMockServer({
   port: Number(process.env.PORT ?? 3000),
   routes: {
     // Serve index.html for all unmatched routes (client-side routing).

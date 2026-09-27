@@ -96,12 +96,15 @@ export class PushHub {
   }
 
   private onMessage(ws: Socket, raw: string | Buffer): void {
-    let message: { type?: string; uuid?: string; token?: string };
+    let parsed: unknown;
     try {
-      message = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+      parsed = JSON.parse(typeof raw === "string" ? raw : raw.toString());
     } catch {
       return;
     }
+    // JSON.parse happily returns null, numbers, strings and arrays; ignore them.
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return;
+    const message = parsed as { type?: string; uuid?: string; token?: string };
 
     switch (message.type) {
       case "login": {
