@@ -138,14 +138,16 @@ export class Database {
   }
 
   /**
-   * Whether `userId` is on project `projectId`. Membership is the one rule for
-   * who may write to a project and who may be assigned its tasks. The owner
-   * is always a member (a seed invariant), so `member_ids` — and the client's
-   * `getMembers()` — is the complete list.
+   * One authorization answer for writing to a project, for routes that need
+   * it before doing anything else (the import). Membership is the one rule
+   * for who may write to a project and who may be assigned its tasks. The
+   * owner is always a member (a seed invariant), so `member_ids` — and the
+   * client's `getMembers()` — is the complete list.
    */
-  isProjectParticipant(projectId: number, userId: number): boolean {
+  canWriteProject(projectId: number, actorId: number): "missing" | "forbidden" | "ok" {
     const project = this.data.projects.find((p) => p.id === projectId);
-    return project !== undefined && isMember(project, userId);
+    if (!project) return "missing";
+    return isMember(project, actorId) ? "ok" : "forbidden";
   }
 
   hasProject(id: number): boolean {
@@ -201,7 +203,8 @@ export class Database {
   updateTask(id: number, body: unknown, actorId: number): UpdateOutcome {
     const task = this.data.tasks.find((t) => t.id === id);
     if (!task) return { kind: "missing" };
-    const project = this.data.projects.find((p) => p.id === task.project_id)!; // tasks always belong to a project
+    const project = this.data.projects.find((p) => p.id === task.project_id);
+    if (!project) return { kind: "missing" }; // an orphan task is unwritable; the seed invariant makes this unreachable
     if (!isMember(project, actorId)) return { kind: "forbidden" };
     const envelope = validateTaskEnvelope(body);
     if (!envelope.ok) return { kind: "invalid", error: envelope.error };
@@ -227,7 +230,9 @@ export class Database {
     const index = this.data.tasks.findIndex((t) => t.id === id);
     if (index === -1) return { kind: "missing" };
     const task = this.data.tasks[index]!;
-    if (!this.isProjectParticipant(task.project_id, actorId)) return { kind: "forbidden" };
+    const project = this.data.projects.find((p) => p.id === task.project_id); // same shape as create/update
+    if (!project) return { kind: "missing" };
+    if (!isMember(project, actorId)) return { kind: "forbidden" };
     this.data.tasks.splice(index, 1);
 
     const comments = this.data.comments.filter((c) => c.task_id === id);
@@ -274,10 +279,30 @@ function isMember(project: ProjectRow, userId: number): boolean {
  * a bad seed fails at startup, not in a route.
  */
 function assertSeedInvariants(data: SeedData): void {
+  const fail = (message: string) => {
+    throw new Error(`seed invariant: ${message}`);
+  };
+  const projects = new Map(data.projects.map((p) => [p.id, p]));
+  const taskIds = new Set(data.tasks.map((t) => t.id));
+  const tagIds = new Set(data.tags.map((t) => t.id));
+  const userIds = new Set(data.users.map((u) => u.id));
+
   for (const project of data.projects) {
-    if (!project.member_ids.includes(project.owner_id)) {
-      throw new Error(`seed invariant: project ${project.id} owner ${project.owner_id} must be in member_ids`);
-    }
+    if (!project.member_ids.includes(project.owner_id)) fail(`project ${project.id} owner ${project.owner_id} must be in member_ids`);
+    for (const id of project.member_ids) if (!userIds.has(id)) fail(`project ${project.id} member ${id} is not a user`);
+  }
+  for (const task of data.tasks) {
+    if (!projects.has(task.project_id)) fail(`task ${task.id} belongs to missing project ${task.project_id}`);
+    if (task.assignee_id !== null && !userIds.has(task.assignee_id)) fail(`task ${task.id} assignee ${task.assignee_id} is not a user`);
+    // deliberately NOT asserted: assignee ∈ members. The write rule applies to a CHANGED assignee only,
+    // so a task may keep an assignee who has since left the project (docs/API.md).
+  }
+  for (const comment of data.comments) {
+    if (!taskIds.has(comment.task_id)) fail(`comment ${comment.id} belongs to missing task ${comment.task_id}`);
+    if (!userIds.has(comment.author_id)) fail(`comment ${comment.id} author ${comment.author_id} is not a user`);
+  }
+  for (const link of data.task_tags) {
+    if (!taskIds.has(link.task_id) || !tagIds.has(link.tag_id)) fail(`task_tags link ${link.task_id}-${link.tag_id} references a missing row`);
   }
 }
 

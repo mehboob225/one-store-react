@@ -57,15 +57,24 @@ import { canonicalKey, hasField, isKeyValue, ownField } from "./canonicalKey";
 
 export type Unsubscribe = () => void;
 
-/** Called when a listener throws; the other listeners still run. */
-export type ListenerErrorHandler = (error: unknown, context: { key?: string }) => void;
+/**
+ * What the bus reports through its error handler:
+ *  - `listener`: a listener threw during delivery (the others still run);
+ *  - `selector`: `subscribe` was given a selector that can never fire (it
+ *    was not registered; the caller got a no-op unsubscribe).
+ */
+export type BusErrorContext = { kind: "listener" | "selector"; key?: string };
+
+/** Receives every report; the default logs to the console. */
+export type ListenerErrorHandler = (error: unknown, context: BusErrorContext) => void;
 
 const defaultErrorHandler: ListenerErrorHandler = (error, context) => {
-  console.error(context.key ? `listener for "${context.key}" threw` : "listener threw", error);
+  const where = context.key ? ` "${context.key}"` : "";
+  console.error(context.kind === "selector" ? `subscribe: invalid selector${where}, it can never fire` : `listener for${where} threw`, error);
 };
 
 /** Reports a listener error; a throwing custom handler must not escape delivery either. */
-function report(handler: ListenerErrorHandler, error: unknown, context: { key?: string }): void {
+function report(handler: ListenerErrorHandler, error: unknown, context: BusErrorContext): void {
   try {
     handler(error, context);
   } catch (handlerError) {
@@ -88,7 +97,7 @@ function deliver<P>(
   live: ReadonlySet<Entry<P>>,
   payload: P,
   onError: ListenerErrorHandler,
-  context: { key?: string },
+  context: BusErrorContext,
   snapshot: readonly Entry<P>[] = Array.from(live),
 ): void {
   for (const entry of snapshot) {
@@ -117,7 +126,7 @@ export class EventHandler<T> {
 
   /** Calls every listener synchronously (see the delivery contract above). */
   emit(payload: T): void {
-    deliver(this.entries, payload, this.onListenerError, {});
+    deliver(this.entries, payload, this.onListenerError, { kind: "listener" });
   }
 
   get size(): number {
@@ -197,7 +206,7 @@ function resolve(selector: DataEventSelector): Resolved {
     throw new TypeError(`eventKey: selector for "${objectType}" has both an id and a foreign key; pick one`);
   }
   if (hasForeignKey) {
-    if (typeof keyName !== "string" || !isKeyValue(key)) {
+    if (!isKeyValue(keyName) || typeof keyName !== "string" || !isKeyValue(key)) {
       throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key (a finite number or non-empty string)`);
     }
     const value = canonicalKey(key);
@@ -256,7 +265,7 @@ export class DataEventHandler {
       // key…) is a bug, but not one worth taking a render tree down for: report it loudly through
       // the bus's error handler and hand back a no-op unsubscribe. `eventKey` still throws, for
       // callers that want the exception.
-      report(this.onListenerError, error, { key: describeSelector(selector) });
+      report(this.onListenerError, error, { kind: "selector", key: describeSelector(selector) });
       return () => {};
     }
     const entry: Entry<DataEventBatch> = { listener };
@@ -325,7 +334,15 @@ export class DataEventHandler {
 
   /** Number of listeners for a selector (or in total). Mostly for tests and diagnostics. */
   listenerCount(selector?: DataEventSelector): number {
-    if (selector) return this.targetFor(resolve(selector), false)?.size ?? 0;
+    if (selector) {
+      let resolved: Resolved;
+      try {
+        resolved = resolve(selector);
+      } catch {
+        return 0; // a selector `subscribe` would have refused has no listeners, by construction
+      }
+      return this.targetFor(resolved, false)?.size ?? 0;
+    }
     let total = 0;
     for (const type of this.types.values()) {
       total += type.bucket.size;
@@ -437,7 +454,7 @@ export class DataEventHandler {
         objectType: entry.objectType,
         ids: Object.freeze([...entry.ids.values()]),
       });
-      deliver(target, batch, this.onListenerError, { key: entry.key }, snapshot);
+      deliver(target, batch, this.onListenerError, { kind: "listener", key: entry.key }, snapshot);
     }
   }
 
@@ -459,10 +476,23 @@ function getOrCreate(map: Map<string, Target>, key: string, create: boolean): Ta
   return target;
 }
 
-/** Best-effort label for an invalid selector in an error report. */
-function describeSelector(selector: DataEventSelector): string {
-  const { objectType, id, keyName, key } = selector as { objectType: string; id?: unknown; keyName?: unknown; key?: unknown };
-  return `${objectType}${id !== undefined ? `/${String(id)}` : ""}${keyName !== undefined || key !== undefined ? `/${String(keyName)}/${String(key)}` : ""}`;
+/** Best-effort label for an invalid selector in an error report. Must never throw: it runs inside a catch. */
+function describeSelector(selector: unknown): string {
+  try {
+    if (typeof selector !== "object" || selector === null) return `<${typeof selector}>`;
+    const { objectType, id, keyName, key } = selector as { objectType?: unknown; id?: unknown; keyName?: unknown; key?: unknown };
+    const show = (v: unknown) => {
+      try {
+        return typeof v === "symbol" ? v.toString() : String(v);
+      } catch {
+        return "<unprintable>";
+      }
+    };
+    const fk = keyName !== undefined || key !== undefined ? `/${show(keyName)}/${show(key)}` : "";
+    return `${show(objectType)}${id !== undefined ? `/${show(id)}` : ""}${fk}`;
+  } catch {
+    return "<invalid selector>";
+  }
 }
 
 function indexById(objects: readonly Row[], index: string): Map<string, Row> {

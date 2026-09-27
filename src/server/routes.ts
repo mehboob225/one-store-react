@@ -147,11 +147,15 @@ export function createRoutes(ctx: RouteContext) {
     "/api/v1/projects/:id/tasks/import": {
       POST: authed<"/api/v1/projects/:id/tasks/import">((req, userId) => {
         const projectId = Number(req.params.id);
+        // Authorize once, before any write.
+        const access = db.canWriteProject(projectId, userId);
+        if (access === "missing") return notFound("project");
+        if (access === "forbidden") return forbidden();
         const titles = ["Imported: triage backlog", "Imported: write docs", "Imported: plan release"];
-        // createTask decides existence and membership; the first outcome says which applies.
         const outcomes = titles.map((title) => db.createTask(projectId, { title }, userId));
-        if (outcomes[0]?.kind === "missing") return notFound("project");
-        if (outcomes[0]?.kind === "forbidden") return forbidden();
+        // The titles are server constants: a rejected one is a server bug, not a client error.
+        const rejected = outcomes.find((o) => o.kind === "invalid");
+        if (rejected) throw new Error(`import: a server-owned title was rejected: ${rejected.error}`);
         const imported = outcomes.filter((o) => o.kind === "created").length; // what was written, not attempted
         if (imported > 0) push.broadcast({ type: "reload", objectType: "project", objectId: projectId });
         return Response.json({ imported });

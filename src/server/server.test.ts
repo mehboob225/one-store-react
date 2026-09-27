@@ -313,8 +313,9 @@ describe("projects and tasks", () => {
     expect(mock.db.updateTask(1, "nope", 1)).toEqual({ kind: "invalid", error: "task must be an object" });
     expect(mock.db.updateTask(1, { hash: "t1-1" }, 3).kind).toBe("forbidden");
     expect(mock.db.deleteTask(1, 3).kind).toBe("forbidden");
-    expect(mock.db.isProjectParticipant(1, 3)).toBe(false);
-    expect(mock.db.isProjectParticipant(2, 1)).toBe(true);
+    expect(mock.db.canWriteProject(1, 3)).toBe("forbidden");
+    expect(mock.db.canWriteProject(2, 1)).toBe("ok");
+    expect(mock.db.canWriteProject(999, 1)).toBe("missing");
   });
 
   test("an unchanged assignee never blocks an unrelated edit, even after that user left the project (review 11, finding 1)", async () => {
@@ -322,7 +323,7 @@ describe("projects and tasks", () => {
     const data = seed();
     data.projects.find((p) => p.id === 2)!.member_ids = [2];
     mock.db.reset(data);
-    expect(mock.db.isProjectParticipant(2, 1)).toBe(false);
+    expect(mock.db.canWriteProject(2, 1)).toBe("forbidden");
 
     const grace = await authHeaderFor("grace@example.com"); // still on project 2; Ada no longer is, so she may not write to it
     const put = (task: object) => api("/tasks/5", { method: "PUT", body: JSON.stringify({ task }) }, grace);
@@ -347,16 +348,30 @@ describe("projects and tasks", () => {
     expect((await api("/tasks/1", { method: "DELETE" }, alan)).status).toBe(403);
     expect((await api("/projects/1/tasks/import", { method: "POST" }, alan)).status).toBe(403);
     expect((await api("/projects/999/tasks/import", { method: "POST" }, alan)).status).toBe(404); // 404 before 403
+    // the import authorizes once, before any write: Alan's refused import created nothing
+    expect(((await (await api("/projects/1/tasks")).json()) as { tasks: { title: string }[] }).tasks.some((t) => t.title.startsWith("Imported:"))).toBe(false);
     // nothing was written or broadcast for Alan's attempts
     expect(((await (await api("/projects/1/tasks")).json()) as { tasks: unknown[] }).tasks).toHaveLength(3);
     // a member may do all of it
     expect((await api("/projects/1/tasks", { method: "POST", body: JSON.stringify({ task: { title: "x" } }) })).status).toBe(201);
   });
 
-  test("the owner is always a member: a seed that breaks it is refused at load (review 13, finding 3)", () => {
-    const data = seed();
-    data.projects[0]!.member_ids = [2]; // owner 1 dropped
-    expect(() => mock.db.reset(data)).toThrow(/project 1 owner 1 must be in member_ids/);
+  test("seed invariants are asserted at load: owner membership and every reference (review 13 finding 3, review 14 finding 1)", () => {
+    const broken = (mutate: (d: ReturnType<typeof seed>) => void) => {
+      const data = seed();
+      mutate(data);
+      return () => mock.db.reset(data);
+    };
+    expect(broken((d) => (d.projects[0]!.member_ids = [2]))).toThrow(/project 1 owner 1 must be in member_ids/);
+    expect(broken((d) => d.tasks.push({ id: 99, project_id: 42, assignee_id: null, title: "orphan", status: "todo", due_on: null, hash: "t99-1" }))).toThrow(
+      /task 99 belongs to missing project 42/,
+    );
+    expect(broken((d) => (d.tasks[0]!.assignee_id = 999))).toThrow(/task 1 assignee 999 is not a user/);
+    expect(broken((d) => d.comments.push({ id: 99, task_id: 42, author_id: 1, body: "x", created_at: "" }))).toThrow(/comment 99 belongs to missing task 42/);
+    expect(broken((d) => d.task_tags.push({ task_id: 1, tag_id: 42 }))).toThrow(/task_tags link 1-42 references a missing row/);
+    expect(broken((d) => d.projects[0]!.member_ids.push(42))).toThrow(/project 1 member 42 is not a user/);
+    // NOT an invariant: an assignee who has left the project (the write rule applies to a changed assignee only)
+    expect(broken((d) => (d.projects.find((p) => p.id === 2)!.member_ids = [2]))).not.toThrow();
     mock.db.reset(); // back to a valid seed for the next test
     for (const p of mock.db.listProjects()) expect(p.member_ids).toContain(p.owner_id);
   });
@@ -370,18 +385,24 @@ describe("projects and tasks", () => {
       originalBroadcast(message);
     };
     try {
-      // one of the three creates fails: the count must say 2, not 3
-      let calls = 0;
-      mock.db.createTask = (projectId, body, actorId) => (++calls === 2 ? { kind: "invalid", error: "stubbed" } : originalCreate(projectId, body, actorId));
-      let body = (await (await api("/projects/2/tasks/import", { method: "POST" })).json()) as { imported: number };
-      expect(body.imported).toBe(2);
+      // the normal case: everything created, one reload
+      const body = (await (await api("/projects/2/tasks/import", { method: "POST" })).json()) as { imported: number };
+      expect(body.imported).toBe(3);
       expect(broadcasts).toEqual([{ type: "reload", objectType: "project", objectId: 2 }]);
 
-      // every create fails: nothing written, nothing broadcast
+      // the titles are server constants, so a rejected one is a server bug: 500, not a quiet short count
       broadcasts.length = 0;
-      mock.db.createTask = () => ({ kind: "invalid", error: "stubbed" });
-      body = (await (await api("/projects/2/tasks/import", { method: "POST" })).json()) as { imported: number };
-      expect(body.imported).toBe(0);
+      let calls = 0;
+      mock.db.createTask = (projectId, body, actorId) => (++calls === 2 ? { kind: "invalid", error: "stubbed" } : originalCreate(projectId, body, actorId));
+      const originalError = console.error;
+      console.error = () => {}; // the server logs the deliberate exception; keep the runner output clean
+      try {
+        const res = await api("/projects/2/tasks/import", { method: "POST" });
+        expect(res.status).toBe(500);
+        expect(await res.json()).toEqual({ error: "internal error" });
+      } finally {
+        console.error = originalError;
+      }
       expect(broadcasts).toEqual([]);
     } finally {
       mock.db.createTask = originalCreate;

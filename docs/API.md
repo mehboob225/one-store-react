@@ -16,6 +16,7 @@ shapes, or the factories (step 11) are the place to adapt.
 | Unauthenticated | `401 {"error":"unauthorized"}` |
 | Authorization | reads are workspace-wide; **writes to a project's tasks require membership** of that project: `403 {"error":"not a member of this project"}`, decided after `404` and before any body check |
 | Not found | `404 {"error":"<thing> not found"}`; unknown `/api/*` paths are JSON 404, never the HTML fallback |
+| Server error | a route that throws answers `500 {"error":"internal error"}` (JSON, never the HTML fallback) and logs the exception |
 | Response shape | an object keyed by bucket name: lists `{ tasks: [...] }`, singles `{ task: {...} }` |
 | Embedded objects | `tasks` carry `assignee` (a public user or `null`); the client lifts it into the `users` bucket |
 | User representations | public users (`user`, `assignee`, `/users`) carry `id` and `name` only; `current_user` additionally carries `email` and `settings` and is only ever sent to that user |

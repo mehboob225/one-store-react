@@ -629,6 +629,16 @@ describe("validateModelDefinitions", () => {
     expect(invalidForeignKeyFields("tasks", { id: 1 })).toEqual([]);
   });
 
+  test("a mistyped join foreign-key entry is reported once, by the join type, not blamed by hasMany (review 14, finding 9)", () => {
+    expect(
+      withDefs({
+        tags: { index: "id", model: "TagModel" },
+        tasks: { index: "id", hasMany: { tags: { objectType: "tags", through: "joins", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } } },
+        joins: { index: "id", foreignKeys: { task_id: "tasks" as unknown as ForeignKeyDefinition, tag_id: { objectType: "tags", getter: "getTag" } }, belongsTo: ["tasks"] },
+      }),
+    ).toEqual(["joins: foreignKeys.task_id must be an object"]);
+  });
+
   test("cascadeDelete must be a boolean (review 7, finding 5)", () => {
     expect(
       withDefs({

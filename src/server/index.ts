@@ -66,6 +66,11 @@ export function createMockServer(options: MockServerOptions = {}): MockServer {
     fetch() {
       return new Response("not found", { status: 404 });
     },
+    // A route that throws is a server bug: answer 500 as JSON (never the HTML fallback) and log it.
+    error(error) {
+      console.error("mock server: unhandled route error", error);
+      return Response.json({ error: "internal error" }, { status: 500 });
+    },
     websocket: push.handler,
     development: options.development ?? false,
   });

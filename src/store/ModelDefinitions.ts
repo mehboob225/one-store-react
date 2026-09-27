@@ -575,6 +575,7 @@ function checkHasManyEntry(ctx: TypeContext, name: string, hm: HasManyDefinition
 
 function checkJoinKey(ctx: TypeContext, label: string, throughType: string, through: ModelDefinition, key: string, expected: string | undefined): void {
   const fk = isRecord(through.foreignKeys) ? own(through.foreignKeys, key) : undefined;
+  if (fk !== undefined && !isRecord(fk)) return; // a mistyped entry is reported by the join type's own check
   if (!fk) problem(ctx, `${label}: ${throughType} does not declare foreignKeys.${key}`);
   else if (expected !== undefined && fk.objectType !== expected) {
     problem(ctx, `${label}: ${throughType}.${key} points at ${fk.objectType}, not ${expected}`);
