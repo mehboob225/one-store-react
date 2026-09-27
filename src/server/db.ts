@@ -15,7 +15,11 @@ import {
   type UserRow,
 } from "./fixtures";
 
-export type PublicUser = Omit<UserRow, "password">;
+/** What other users may see: no password, no settings. */
+export type PublicUser = Omit<UserRow, "password" | "settings">;
+
+/** What the logged-in user sees about themselves. */
+export type CurrentUser = Omit<UserRow, "password">;
 
 export interface NewTask {
   title: string;
@@ -25,6 +29,45 @@ export interface NewTask {
 }
 
 export type TaskPatch = Partial<Omit<TaskRow, "id" | "project_id" | "hash">> & { hash: string };
+
+export const TASK_STATUSES: readonly TaskRow["status"][] = ["todo", "doing", "done"];
+
+/** The only task fields a client may change. `id`, `project_id`, `hash` are server-owned. */
+const MUTABLE_TASK_FIELDS = ["title", "status", "assignee_id", "due_on"] as const;
+type MutableTaskField = (typeof MUTABLE_TASK_FIELDS)[number];
+
+/**
+ * Validates an untrusted patch body. Unknown and immutable fields are
+ * dropped; badly typed values are reported.
+ */
+export function sanitizeTaskPatch(input: unknown): { patch: TaskPatch } | { error: string } {
+  if (typeof input !== "object" || input === null) return { error: "task must be an object" };
+  const body = input as Record<string, unknown>;
+  if (typeof body.hash !== "string") return { error: "task.hash is required" };
+
+  const patch: TaskPatch = { hash: body.hash };
+  for (const field of MUTABLE_TASK_FIELDS) {
+    if (!(field in body)) continue;
+    const value = body[field];
+    const problem = validateTaskField(field, value);
+    if (problem) return { error: problem };
+    (patch as Record<MutableTaskField, unknown>)[field] = value;
+  }
+  return { patch };
+}
+
+function validateTaskField(field: MutableTaskField, value: unknown): string | undefined {
+  switch (field) {
+    case "title":
+      return typeof value === "string" && value.trim() !== "" ? undefined : "task.title must be a non-empty string";
+    case "status":
+      return TASK_STATUSES.includes(value as TaskRow["status"]) ? undefined : `task.status must be one of ${TASK_STATUSES.join(", ")}`;
+    case "assignee_id":
+      return value === null || typeof value === "number" ? undefined : "task.assignee_id must be a number or null";
+    case "due_on":
+      return value === null || typeof value === "string" ? undefined : "task.due_on must be a string or null";
+  }
+}
 
 export class ConflictError extends Error {
   constructor(public readonly current: TaskRow) {
@@ -69,11 +112,17 @@ export class Database {
     return user ? publicUser(user) : undefined;
   }
 
-  updateUserSettings(id: number, settings: Record<string, unknown>): PublicUser | undefined {
+  /** Includes `settings`; only ever returned to that user. */
+  getCurrentUser(id: number): CurrentUser | undefined {
+    const user = this.data.users.find((u) => u.id === id);
+    return user ? currentUser(user) : undefined;
+  }
+
+  updateUserSettings(id: number, settings: Record<string, unknown>): CurrentUser | undefined {
     const user = this.data.users.find((u) => u.id === id);
     if (!user) return undefined;
     user.settings = { ...user.settings, ...settings };
-    return publicUser(user);
+    return currentUser(user);
   }
 
   // ---- projects ----------------------------------------------------------
@@ -113,14 +162,19 @@ export class Database {
     return clone(task);
   }
 
-  /** Throws ConflictError when `patch.hash` does not match the stored hash. */
+  /**
+   * Applies only the mutable fields (see MUTABLE_TASK_FIELDS); `id`,
+   * `project_id` and `hash` can never be set by a caller.
+   * Throws ConflictError when `patch.hash` does not match the stored hash.
+   */
   updateTask(id: number, patch: TaskPatch): TaskRow | undefined {
     const task = this.data.tasks.find((t) => t.id === id);
     if (!task) return undefined;
     if (patch.hash !== task.hash) throw new ConflictError(clone(task));
 
-    const { hash: _ignored, ...fields } = patch;
-    Object.assign(task, fields);
+    for (const field of MUTABLE_TASK_FIELDS) {
+      if (field in patch) (task as Record<MutableTaskField, unknown>)[field] = patch[field];
+    }
     task.hash = bumpHash(task.hash);
     return clone(task);
   }
@@ -170,7 +224,12 @@ function maxId(rows: { id: number }[]): number {
 }
 
 function publicUser(user: UserRow): PublicUser {
-  const { password: _ignored, ...rest } = user;
+  const { password: _p, settings: _s, ...rest } = user;
+  return rest;
+}
+
+function currentUser(user: UserRow): CurrentUser {
+  const { password: _p, ...rest } = user;
   return { ...rest, settings: { ...rest.settings } };
 }
 

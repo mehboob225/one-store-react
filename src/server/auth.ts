@@ -14,8 +14,15 @@ export interface Session {
 
 export class Sessions {
   private readonly byUuid = new Map<string, Session>();
+  private readonly revokeListeners = new Set<(session: Session) => void>();
 
   constructor(private readonly db: Database) {}
+
+  /** Called whenever a session is revoked (sign-out, clear). */
+  onRevoke(listener: (session: Session) => void): () => void {
+    this.revokeListeners.add(listener);
+    return () => this.revokeListeners.delete(listener);
+  }
 
   signIn(email: string, password: string): { session: Session; user: PublicUser } | undefined {
     const user = this.db.findUserByEmail(email);
@@ -45,11 +52,14 @@ export class Sessions {
   }
 
   revoke(uuid: string): void {
+    const session = this.byUuid.get(uuid);
+    if (!session) return;
     this.byUuid.delete(uuid);
+    for (const listener of this.revokeListeners) listener(session);
   }
 
   clear(): void {
-    this.byUuid.clear();
+    for (const uuid of this.byUuid.keys()) this.revoke(uuid);
   }
 }
 

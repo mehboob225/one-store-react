@@ -10,7 +10,7 @@
  *   - every mutation broadcasts a push message
  */
 import type { BunRequest } from "bun";
-import { ConflictError, type Database, type NewTask, type TaskPatch } from "./db";
+import { ConflictError, sanitizeTaskPatch, type Database, type NewTask } from "./db";
 import { unauthorized, type Sessions } from "./auth";
 import type { PushHub } from "./push";
 
@@ -73,9 +73,9 @@ export function createRoutes(ctx: RouteContext) {
     "/api/v1/users/current": {
       GET: authed<"/api/v1/users/current">((_req, userId) => {
         const user = db.getUser(userId);
-        if (!user) return notFound("user");
-        const { settings, ...publicFields } = user;
-        return Response.json({ user: publicFields, current_user: { ...publicFields, settings } });
+        const current = db.getCurrentUser(userId);
+        if (!user || !current) return notFound("user");
+        return Response.json({ user, current_user: current });
       }),
     },
 
@@ -85,7 +85,8 @@ export function createRoutes(ctx: RouteContext) {
         if (!body?.settings) return badRequest("settings is required");
         const user = db.updateUserSettings(userId, body.settings);
         if (!user) return notFound("user");
-        push.broadcast({ type: "update", objectType: "current_user", data: user });
+        // Personal data: only this user's other sessions/tabs should hear about it.
+        push.sendToUser(userId, { type: "update", objectType: "current_user", data: user });
         return Response.json({ current_user: user });
       }),
     },
@@ -146,10 +147,11 @@ export function createRoutes(ctx: RouteContext) {
       }),
       PUT: authed<"/api/v1/tasks/:id">(async (req) => {
         const id = Number(req.params.id);
-        const body = await json<{ task?: Partial<TaskPatch> }>(req);
-        if (!body?.task?.hash) return badRequest("task.hash is required");
+        const body = await json<{ task?: unknown }>(req);
+        const sanitized = sanitizeTaskPatch(body?.task);
+        if ("error" in sanitized) return badRequest(sanitized.error);
         try {
-          const task = db.updateTask(id, body.task as TaskPatch);
+          const task = db.updateTask(id, sanitized.patch);
           if (!task) return notFound("task");
           const withAssignee = db.withAssignee(task);
           push.broadcast({ type: "update", objectType: "task", data: withAssignee });

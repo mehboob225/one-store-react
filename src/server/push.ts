@@ -12,12 +12,16 @@
  *
  * Only sockets that completed `login` receive broadcasts. `objectType` is the
  * singular entity name (`"task"`) — the client pluralizes it to the bucket.
+ *
+ * Per-user data (`current_user`) is sent with `sendToUser`, never broadcast.
+ * When a session is revoked its sockets get `session_invalid` and are closed.
  */
 import type { ServerWebSocket, WebSocketHandler } from "bun";
 import type { Sessions } from "./auth";
 
 export interface SocketData {
   userId: number | null;
+  sessionUuid: string | null;
 }
 
 export type PushMessage =
@@ -43,6 +47,7 @@ export class PushHub {
     const interval = options.pingIntervalMs ?? 25_000;
     this.timer = setInterval(() => this.broadcastRaw({ type: "ping" }), interval);
     this.timer.unref?.();
+    this.sessions.onRevoke((session) => this.disconnectSession(session.uuid));
   }
 
   /** Number of authenticated sockets. */
@@ -50,8 +55,25 @@ export class PushHub {
     return this.clients.size;
   }
 
+  /** Sends to every authenticated socket. */
   broadcast(message: PushMessage): void {
     this.broadcastRaw(message);
+  }
+
+  /** Sends only to sockets logged in as `userId`. */
+  sendToUser(userId: number, message: PushMessage): void {
+    const payload = JSON.stringify(message);
+    for (const ws of this.clients) if (ws.data.userId === userId) ws.send(payload);
+  }
+
+  /** Tells every socket of a revoked session it is invalid and closes it. */
+  disconnectSession(uuid: string): void {
+    for (const ws of this.clients) {
+      if (ws.data.sessionUuid !== uuid) continue;
+      this.clients.delete(ws);
+      ws.send(JSON.stringify({ type: "session_invalid" }));
+      ws.close(4001, "session revoked");
+    }
   }
 
   stop(): void {
@@ -90,6 +112,7 @@ export class PushHub {
           return;
         }
         ws.data.userId = session.userId;
+        ws.data.sessionUuid = session.uuid;
         this.clients.add(ws);
         ws.send(JSON.stringify({ type: "login_ok" }));
         return;

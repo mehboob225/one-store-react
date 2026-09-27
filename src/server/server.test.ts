@@ -32,6 +32,11 @@ async function authHeader(): Promise<Record<string, string>> {
   return { authorization: `${uuid}:${token}`, "content-type": "application/json" };
 }
 
+async function authHeaderFor(email: string): Promise<Record<string, string>> {
+  const { uuid, token } = (await (await signIn(email)).json()) as { uuid: string; token: string };
+  return { authorization: `${uuid}:${token}`, "content-type": "application/json" };
+}
+
 async function api(path: string, init: RequestInit = {}, headers?: Record<string, string>) {
   const h = headers ?? (await authHeader());
   return fetch(`${base}/api/v1${path}`, { ...init, headers: { ...h, ...(init.headers ?? {}) } });
@@ -87,6 +92,31 @@ describe("users", () => {
     });
     const body = (await res.json()) as { current_user: { settings: Record<string, unknown> } };
     expect(body.current_user.settings).toEqual({ theme: "dark", sidebar: "collapsed" });
+  });
+
+  test("public user representations never include settings (finding 4)", async () => {
+    const grace = await authHeaderFor("grace@example.com");
+
+    // sign_in payload
+    const signedIn = (await (await signIn()).json()) as { user: Record<string, unknown> };
+    expect(signedIn.user).not.toHaveProperty("settings");
+
+    // `user` bucket in /users/current
+    const me = (await (await api("/users/current", {}, grace)).json()) as { user: Record<string, unknown> };
+    expect(me.user).not.toHaveProperty("settings");
+
+    // embedded assignee seen by another user (task 1 is assigned to Ada)
+    const { task } = (await (await api("/tasks/1", {}, grace)).json()) as {
+      task: { assignee: Record<string, unknown> };
+    };
+    expect(task.assignee).toMatchObject({ id: 1, name: "Ada Lovelace" });
+    expect(task.assignee).not.toHaveProperty("settings");
+    expect(task.assignee).not.toHaveProperty("password");
+
+    const { tasks } = (await (await api("/projects/1/tasks", {}, grace)).json()) as {
+      tasks: { assignee: Record<string, unknown> | null }[];
+    };
+    for (const t of tasks) if (t.assignee) expect(t.assignee).not.toHaveProperty("settings");
   });
 });
 
@@ -158,6 +188,42 @@ describe("projects and tasks", () => {
     const body = await (await api("/projects/2/tasks/import", { method: "POST" })).json();
     expect(body).toEqual({ imported: 3 });
     expect(((await (await api("/projects/2/tasks")).json()) as { tasks: unknown[] }).tasks).toHaveLength(6);
+  });
+
+  test("PUT /tasks/:id ignores immutable and unknown fields (finding 1)", async () => {
+    const { hash } = ((await (await api("/tasks/1")).json()) as { task: { hash: string } }).task;
+    const res = await api("/tasks/1", {
+      method: "PUT",
+      body: JSON.stringify({ task: { hash, id: 2, project_id: 999, bogus: true, title: "Renamed" } }),
+    });
+    expect(res.status).toBe(200);
+    const { task } = (await res.json()) as { task: Record<string, unknown> };
+    expect(task).toMatchObject({ id: 1, project_id: 1, title: "Renamed", hash: "t1-2" });
+    expect(task).not.toHaveProperty("bogus");
+
+    // task 1 still exists under its own id; task 2 is untouched
+    expect((await api("/tasks/1")).status).toBe(200);
+    const two = ((await (await api("/tasks/2")).json()) as { task: { title: string } }).task;
+    expect(two.title).toBe("Punch the cards");
+  });
+
+  test("PUT /tasks/:id validates field values", async () => {
+    const { hash } = ((await (await api("/tasks/1")).json()) as { task: { hash: string } }).task;
+    const bad = async (task: Record<string, unknown>) => {
+      const res = await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash, ...task } }) });
+      expect(res.status).toBe(400);
+      return ((await res.json()) as { error: string }).error;
+    };
+    expect(await bad({ status: "archived" })).toContain("task.status");
+    expect(await bad({ title: "" })).toContain("task.title");
+    expect(await bad({ assignee_id: "1" })).toContain("task.assignee_id");
+    expect(await bad({ due_on: 42 })).toContain("task.due_on");
+    expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: {} }) })).status).toBe(400);
+    expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: "nope" }) })).status).toBe(400);
+
+    // nothing was written: hash unchanged
+    const after = ((await (await api("/tasks/1")).json()) as { task: { hash: string } }).task;
+    expect(after.hash).toBe(hash);
   });
 });
 
@@ -239,5 +305,57 @@ describe("push", () => {
     const raced = await Promise.race([next(), new Promise<"none">((r) => setTimeout(() => r("none"), 100))]);
     expect(raced).toBe("none");
     ws.close();
+  });
+
+  async function loggedIn(headers: Record<string, string>) {
+    const [uuid, token] = headers.authorization!.split(":");
+    const client = connect();
+    await open(client.ws);
+    client.ws.send(JSON.stringify({ type: "login", uuid, token }));
+    await client.next("login_ok");
+    return { ...client, uuid };
+  }
+
+  test("sign_out invalidates and closes that session's socket (finding 2)", async () => {
+    const ada = await authHeaderFor("ada@example.com");
+    const grace = await authHeaderFor("grace@example.com");
+    const adaSocket = await loggedIn(ada);
+    const graceSocket = await loggedIn(grace);
+    expect(mock.push.clientCount).toBe(2);
+
+    const closed = new Promise<number>((resolve) => adaSocket.ws.addEventListener("close", (e) => resolve(e.code)));
+    expect((await api("/sign_out", { method: "DELETE" }, ada)).status).toBe(200);
+
+    expect((await adaSocket.next("session_invalid")).type).toBe("session_invalid");
+    expect(await closed).toBe(4001);
+    expect(mock.push.clientCount).toBe(1);
+
+    // Grace's mutation reaches Grace but not Ada's dead socket
+    await api("/projects/2/tasks", { method: "POST", body: JSON.stringify({ task: { title: "After" } }) }, grace);
+    expect((await graceSocket.next("new")).type).toBe("new");
+    const leaked = await Promise.race([adaSocket.next("new"), new Promise<"none">((r) => setTimeout(() => r("none"), 100))]);
+    expect(leaked).toBe("none");
+
+    graceSocket.ws.close();
+  });
+
+  test("settings updates reach only the owner's sockets (finding 3)", async () => {
+    const ada = await authHeaderFor("ada@example.com");
+    const adaAgain = await authHeaderFor("ada@example.com"); // second tab / device
+    const grace = await authHeaderFor("grace@example.com");
+    const tab1 = await loggedIn(ada);
+    const tab2 = await loggedIn(adaAgain);
+    const graceSocket = await loggedIn(grace);
+
+    await api("/users/current/settings", { method: "PUT", body: JSON.stringify({ settings: { sidebar: "collapsed" } }) }, ada);
+
+    for (const tab of [tab1, tab2]) {
+      const msg = await tab.next("update");
+      expect(msg).toMatchObject({ objectType: "current_user", data: { id: 1, settings: { theme: "dark", sidebar: "collapsed" } } });
+    }
+    const leaked = await Promise.race([graceSocket.next("update"), new Promise<"none">((r) => setTimeout(() => r("none"), 100))]);
+    expect(leaked).toBe("none");
+
+    for (const c of [tab1, tab2, graceSocket]) c.ws.close();
   });
 });

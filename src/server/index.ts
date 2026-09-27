@@ -39,7 +39,7 @@ export function createMockServer(options: MockServerOptions = {}): MockServer {
       ...createRoutes({ db, sessions, push }),
       // Named route so the HTML catch-all ("/*") never shadows the upgrade.
       "/push": (req: BunRequest<"/push">, server: Server<SocketData>) => {
-        const upgraded = server.upgrade(req, { data: { userId: null } });
+        const upgraded = server.upgrade(req, { data: { userId: null, sessionUuid: null } });
         return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
       },
       ...options.routes,
