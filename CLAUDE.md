@@ -30,8 +30,9 @@ copy it to `.env` (gitignored, auto-loaded by Bun).
 
 `src/auth/AuthenticationService.ts` owns credentials (`uuid:token`), persisted in
 localStorage and cached in memory. It uses plain `fetch` and never writes to the store.
-`handleLogout()` wipes every `_state_*` key (persisted UI atoms). Persisted UI state
-must use that prefix.
+Every change goes through one generation-guarded `commit()`; a logout or user switch (also
+from another tab) wipes every `_state_*` key (persisted UI atoms). Persisted UI state must
+use that prefix.
 
 ## Conventions
 

@@ -11,9 +11,15 @@
  * or out is picked up through the `storage` event. If browser storage is
  * unavailable (private mode, blocked), the service degrades to memory-only.
  *
- * `handleLogout()` also wipes every `_state_*` key from localStorage and
- * sessionStorage: those are the persisted UI atoms (step 14), which must
- * never survive an account switch.
+ * Every change goes through one `commit()` path, which:
+ *   - bumps a generation counter, so an async login or logout that finishes
+ *     after a newer change is discarded instead of overwriting it (the same
+ *     idea as the store's generation guard);
+ *   - wipes every `_state_*` key from localStorage and sessionStorage when
+ *     the signed-in *user* changes or signs out — those are the persisted UI
+ *     atoms (step 14), which must never leak across accounts or survive a
+ *     logout, including a logout performed in another tab;
+ *   - notifies subscribers after the storage is consistent.
  */
 import { DomainConfiguration } from "../config/DomainConfiguration";
 
@@ -23,7 +29,15 @@ export interface Credentials {
   userId: number;
 }
 
-export type AuthenticationErrorCode = "invalid_credentials" | "network" | "server";
+export type AuthenticationErrorCode =
+  /** 401 from sign_in: wrong email or password. */
+  | "invalid_credentials"
+  /** The request never got a response. */
+  | "network"
+  /** Non-401 failure, or a 2xx whose body is not a valid sign_in payload. */
+  | "server"
+  /** Authentication changed while the request was in flight; the result was discarded. */
+  | "superseded";
 
 export class AuthenticationError extends Error {
   constructor(
@@ -62,6 +76,18 @@ export const PERSISTED_STATE_PREFIX = "_state_";
 
 type Listener = (credentials: Credentials | null) => void;
 
+/**
+ * The one credential validator, shared by login responses, restored storage
+ * and externally supplied credentials. Blank strings are not credentials.
+ */
+export function toCredentials(value: unknown): Credentials | null {
+  if (typeof value !== "object" || value === null) return null;
+  const { uuid, token, userId } = value as Record<string, unknown>;
+  if (!isNonBlankString(uuid) || !isNonBlankString(token)) return null;
+  if (typeof userId !== "number" || !Number.isFinite(userId)) return null;
+  return { uuid, token, userId };
+}
+
 export class AuthenticationServiceClass {
   private readonly apiBase: string;
   private readonly local: KeyValueStorage | null;
@@ -69,19 +95,21 @@ export class AuthenticationServiceClass {
   private readonly fetchImpl: FetchLike;
   private readonly listeners = new Set<Listener>();
   private credentials: Credentials | null;
+  /** Bumped on every committed change; async operations compare before committing. */
+  private generation = 0;
 
   constructor(options: AuthenticationServiceOptions = {}) {
     this.apiBase = options.apiBase ?? DomainConfiguration.api;
-    this.local = orDefault(options.localStorage, () => defaultStorage("localStorage"));
-    this.session = orDefault(options.sessionStorage, () => defaultStorage("sessionStorage"));
+    this.local = options.localStorage === undefined ? defaultStorage("localStorage") : options.localStorage;
+    this.session = options.sessionStorage === undefined ? defaultStorage("sessionStorage") : options.sessionStorage;
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
-    this.credentials = this.readCredentials();
+    this.credentials = this.readStoredCredentials();
 
-    const target = orDefault(options.eventTarget, defaultWindow);
+    const target = options.eventTarget === undefined ? defaultWindow() : options.eventTarget;
     target?.addEventListener("storage", (event) => {
-      if ((event as StorageEvent).key === CREDENTIALS_STORAGE_KEY || (event as StorageEvent).key === null) {
-        this.setCredentialsInMemory(this.readCredentials());
-      }
+      const key = (event as StorageEvent).key;
+      // key === null means the other tab called storage.clear()
+      if (key === CREDENTIALS_STORAGE_KEY || key === null) this.commit(this.readStoredCredentials(), { persist: false });
     });
   }
 
@@ -100,7 +128,7 @@ export class AuthenticationServiceClass {
     return this.credentials ? `${this.credentials.uuid}:${this.credentials.token}` : null;
   }
 
-  /** Notifies on login/logout (including from another tab). Returns unsubscribe. */
+  /** Notifies on login/logout/account switch (including from another tab). Returns unsubscribe. */
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
@@ -108,7 +136,14 @@ export class AuthenticationServiceClass {
 
   // ---- login / logout ----------------------------------------------------
 
+  /**
+   * Signs in. Rejects with an AuthenticationError for every failure,
+   * including a response that arrives after authentication changed
+   * (`superseded`) — that result is discarded, not applied.
+   */
   async login(email: string, password: string): Promise<Credentials> {
+    const generation = this.generation;
+
     let response: Response;
     try {
       response = await this.fetchImpl(`${this.apiBase}v1/sign_in`, {
@@ -123,39 +158,49 @@ export class AuthenticationServiceClass {
     if (response.status === 401) throw new AuthenticationError("invalid_credentials", "invalid email or password", 401);
     if (!response.ok) throw new AuthenticationError("server", `sign_in failed with status ${response.status}`, response.status);
 
-    const body = (await response.json()) as { uuid?: unknown; token?: unknown; user?: { id?: unknown } };
-    if (typeof body.uuid !== "string" || typeof body.token !== "string" || typeof body.user?.id !== "number") {
-      throw new AuthenticationError("server", "sign_in response is missing uuid, token or user.id");
+    let body: unknown;
+    try {
+      body = await response.json();
+    } catch {
+      throw new AuthenticationError("server", "sign_in response is not JSON", response.status);
     }
+    const payload = typeof body === "object" && body !== null ? (body as Record<string, unknown>) : {};
+    const user = typeof payload.user === "object" && payload.user !== null ? (payload.user as Record<string, unknown>) : {};
+    const credentials = toCredentials({ uuid: payload.uuid, token: payload.token, userId: user.id });
+    if (!credentials) throw new AuthenticationError("server", "sign_in response is missing uuid, token or user.id", response.status);
 
-    const credentials: Credentials = { uuid: body.uuid, token: body.token, userId: body.user.id };
-    this.setCredentials(credentials);
+    if (generation !== this.generation) {
+      throw new AuthenticationError("superseded", "authentication changed while signing in; result discarded");
+    }
+    this.commit(credentials, { persist: true });
     return credentials;
   }
 
   /**
    * Stores credentials obtained elsewhere (e.g. a single-sign-on token in the
-   * URL) as if `login()` had returned them.
+   * URL) as if `login()` had returned them. Throws on malformed input.
    */
   setCredentials(credentials: Credentials): void {
-    safe(() => this.local?.setItem(CREDENTIALS_STORAGE_KEY, JSON.stringify(credentials)));
-    this.setCredentialsInMemory(credentials);
+    const valid = toCredentials(credentials);
+    if (!valid) throw new TypeError("setCredentials: uuid and token must be non-blank strings and userId a number");
+    this.commit(valid, { persist: true });
   }
 
   /**
-   * Signs out: best-effort `DELETE sign_out` on the server (failures are
-   * ignored — the session may already be gone), then local cleanup.
+   * Signs out. Local state is cleared *first* (synchronously), then the
+   * server session is revoked best-effort with the captured header. Nothing
+   * is mutated after the await, so a slow sign_out can never clobber a
+   * session started in the meantime (here or in another tab).
    */
   async logout(): Promise<void> {
     const header = this.authenticationHeader();
-    if (header) {
-      try {
-        await this.fetchImpl(`${this.apiBase}v1/sign_out`, { method: "DELETE", headers: { authorization: header } });
-      } catch {
-        // ignore: local logout proceeds regardless
-      }
-    }
     this.handleLogout();
+    if (!header) return;
+    try {
+      await this.fetchImpl(`${this.apiBase}v1/sign_out`, { method: "DELETE", headers: { authorization: header } });
+    } catch {
+      // ignore: the session may already be gone, and local logout already happened
+    }
   }
 
   /**
@@ -164,9 +209,7 @@ export class AuthenticationServiceClass {
    * `session_invalid`). Does not navigate — the app shell does that.
    */
   handleLogout(): void {
-    safe(() => this.local?.removeItem(CREDENTIALS_STORAGE_KEY));
-    this.clearBrowserStorage();
-    this.setCredentialsInMemory(null);
+    this.commit(null, { persist: true });
   }
 
   /** Removes every `_state_*` key from localStorage and sessionStorage. */
@@ -204,28 +247,49 @@ export class AuthenticationServiceClass {
 
   // ---- internals ----------------------------------------------------------
 
-  private readCredentials(): Credentials | null {
+  /**
+   * The single write path. `persist: false` is for changes observed from
+   * another tab, whose storage writes are already done and must not be
+   * undone here.
+   */
+  private commit(next: Credentials | null, { persist }: { persist: boolean }): void {
+    const prev = this.credentials;
+    if (prev?.uuid === next?.uuid && prev?.token === next?.token && prev?.userId === next?.userId) return;
+
+    this.generation++;
+
+    if (persist) {
+      if (next) {
+        safe(() => this.local?.setItem(CREDENTIALS_STORAGE_KEY, JSON.stringify(next)));
+      } else if (prev) {
+        // Only remove what we own: another tab may already have stored a newer session.
+        safe(() => {
+          const stored = this.readStoredCredentials();
+          if (!stored || stored.uuid === prev.uuid) this.local?.removeItem(CREDENTIALS_STORAGE_KEY);
+        });
+      }
+    }
+
+    // Signed out, or a different user signed in: persisted UI state must go.
+    const userChanged = prev !== null && prev.userId !== next?.userId;
+    if (userChanged) this.clearBrowserStorage();
+
+    this.credentials = next;
+    for (const listener of this.listeners) listener(next);
+  }
+
+  private readStoredCredentials(): Credentials | null {
     return (
       safe(() => {
         const raw = this.local?.getItem(CREDENTIALS_STORAGE_KEY);
-        if (!raw) return null;
-        const parsed = JSON.parse(raw) as Partial<Credentials>;
-        if (typeof parsed.uuid !== "string" || typeof parsed.token !== "string" || typeof parsed.userId !== "number") {
-          return null;
-        }
-        return { uuid: parsed.uuid, token: parsed.token, userId: parsed.userId };
+        return raw ? toCredentials(JSON.parse(raw)) : null;
       }) ?? null
     );
   }
+}
 
-  private setCredentialsInMemory(credentials: Credentials | null): void {
-    const changed =
-      (this.credentials === null) !== (credentials === null) ||
-      this.credentials?.uuid !== credentials?.uuid ||
-      this.credentials?.token !== credentials?.token;
-    this.credentials = credentials;
-    if (changed) for (const listener of this.listeners) listener(credentials);
-  }
+function isNonBlankString(value: unknown): value is string {
+  return typeof value === "string" && value.trim() !== "";
 }
 
 /** Runs `fn`, returning undefined if storage throws (private mode, quota, blocked). */
@@ -235,12 +299,6 @@ function safe<T>(fn: () => T): T | undefined {
   } catch {
     return undefined;
   }
-}
-
-/** `undefined` means "use the default"; `null` is an explicit opt-out and is kept. */
-function orDefault<T>(value: T | undefined, fallback: () => T): T {
-  if (value === undefined) return fallback();
-  return value;
 }
 
 function defaultStorage(name: "localStorage" | "sessionStorage"): KeyValueStorage | null {
