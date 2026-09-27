@@ -82,7 +82,7 @@ export function seed(): SeedData {
     users: [
       { id: 1, name: "Ada Lovelace", email: "ada@example.com", password: "password", settings: { theme: "dark" } },
       { id: 2, name: "Grace Hopper", email: "grace@example.com", password: "password", settings: {} },
-      // on no project: invisible to the others through GET /users
+      // on no project, but a workspace member: visible by name like everyone else
       { id: 3, name: "Alan Turing", email: "alan@example.com", password: "password", settings: {} },
     ],
     projects: [

@@ -86,15 +86,16 @@ describe("auth", () => {
 });
 
 describe("users", () => {
-  test("GET /users lists only users sharing a project with the caller, as id and name (review: no enumeration, no emails)", async () => {
-    const ada = (await (await api("/users")).json()) as { users: Record<string, unknown>[] };
-    expect(ada.users).toEqual([
+  test("GET /users lists every workspace user as id and name only (workspace model: names visible, emails never)", async () => {
+    const expected = [
       { id: 1, name: "Ada Lovelace" },
       { id: 2, name: "Grace Hopper" },
-    ]); // Alan (id 3) shares no project with Ada
-
-    const alan = (await (await api("/users", {}, await authHeaderFor("alan@example.com"))).json()) as { users: unknown[] };
-    expect(alan.users).toEqual([{ id: 3, name: "Alan Turing" }]); // only himself
+      { id: 3, name: "Alan Turing" },
+    ];
+    expect(((await (await api("/users")).json()) as { users: unknown[] }).users).toEqual(expected);
+    // the same for a user on no project: every owner/member/assignee/author key resolves for everyone
+    const alan = await authHeaderFor("alan@example.com");
+    expect(((await (await api("/users", {}, alan)).json()) as { users: unknown[] }).users).toEqual(expected);
   });
 
   test("no public representation anywhere carries an email", async () => {

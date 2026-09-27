@@ -72,7 +72,7 @@ export function createRoutes(ctx: RouteContext) {
     // ---- users -----------------------------------------------------------
 
     "/api/v1/users": {
-      GET: authed<"/api/v1/users">((_req, userId) => Response.json({ users: db.listUsersSharingProjectsWith(userId) })),
+      GET: authed<"/api/v1/users">(() => Response.json({ users: db.listUsers() })),
     },
 
     "/api/v1/users/current": {

@@ -31,13 +31,14 @@
  *                      this type is written (join tables list both sides)
  *   metaData           opt-in keys of per-object side data (saveMetaData)
  *
- * VALUES: the index and every single foreign key must be a non-empty string or
- * a finite number (foreign keys may also be null); `foreignKeysArray` values
- * are arrays of those. Nothing downstream validates this — the event bus
- * accepts any string or number (NaN and "" included) and skips other types
- * without a word — so `assertForeignKeyValues` enforces it on write. Only
- * single foreign keys reach the event bus and the grouped indexes; array keys
- * have accessors but no per-value subscriptions.
+ * VALUES: the index and every single foreign key must be a key value as
+ * defined in canonicalKey.ts (a finite number or a non-empty, non-padded
+ * string; foreign keys may also be null); `foreignKeysArray` values are
+ * arrays of those. The event bus applies the same rule and silently skips
+ * anything else, so `assertForeignKeyValues` enforces it on write, where a
+ * bad value can be reported instead of dropped. Only single foreign keys
+ * reach the event bus and the grouped indexes; array keys have accessors but
+ * no per-value subscriptions.
  *
  * The exported map is deep-frozen; `definitionFor` returns a readonly view.
  */
@@ -210,11 +211,8 @@ interface TypeFacts {
 }
 
 function factsFor(def: ModelDefinition): TypeFacts {
-  return Object.freeze({
-    index: def.index,
-    foreignKeys: Object.freeze(Object.keys(def.foreignKeys ?? {})),
-    foreignKeyArrays: Object.freeze(Object.keys(def.foreignKeysArray ?? {})),
-  });
+  const keysOf = (value: unknown) => Object.freeze(isRecord(value) ? Object.keys(value) : []);
+  return Object.freeze({ index: def.index, foreignKeys: keysOf(def.foreignKeys), foreignKeyArrays: keysOf(def.foreignKeysArray) });
 }
 
 const TYPE_FACTS: Readonly<Record<ObjectType, TypeFacts>> = Object.freeze(
@@ -277,24 +275,27 @@ const RESERVED_CLASS_NAMES = new Set([
   "Object", "Function", "Array", "Number", "Boolean", "String", "Symbol", "BigInt", "Date", "RegExp", "Promise",
   "Error", "AggregateError", "EvalError", "RangeError", "ReferenceError", "SyntaxError", "TypeError", "URIError",
   "Map", "Set", "WeakMap", "WeakSet", "WeakRef", "FinalizationRegistry", "Proxy", "Reflect", "JSON", "Math", "Intl",
-  "Atomics", "ArrayBuffer", "SharedArrayBuffer", "DataView", "Iterator",
+  "Atomics", "ArrayBuffer", "SharedArrayBuffer", "DataView", "Iterator", "AsyncIterator",
   "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array",
-  "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
-  "globalThis", "undefined", "NaN", "Infinity", "PassiveModel",
+  "Float16Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array",
+  "SuppressedError", "DisposableStack", "AsyncDisposableStack",
+  // global functions and values
+  "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURI", "encodeURIComponent", "decodeURI", "decodeURIComponent",
+  "escape", "unescape", "globalThis", "undefined", "NaN", "Infinity",
+  "PassiveModel",
 ]);
 
 function isReservedClassName(name: string): boolean {
   return RESERVED_CLASS_NAMES.has(name);
 }
 
-/** Valid identifier that the generator may emit as a data field, join key or metaData key. */
-function isEmittable(name: string): boolean {
-  return IDENTIFIER.test(name) && !RESERVED.has(name);
-}
-
-/** Valid identifier that the generator may emit as a class member (getter, relation). */
-function isMemberName(name: string): boolean {
-  return IDENTIFIER.test(name) && !RESERVED_MEMBERS.has(name);
+/**
+ * Valid identifier that the generator may emit as a data field, join key or
+ * metaData key. Takes `unknown`: a missing value must fail, not be coerced
+ * to the perfectly valid identifier "undefined" by the regex test.
+ */
+function isEmittable(name: unknown): name is string {
+  return typeof name === "string" && IDENTIFIER.test(name) && !RESERVED.has(name);
 }
 
 /**
@@ -398,8 +399,18 @@ function problem(ctx: TypeContext, what: string): void {
   ctx.problems.push(`${ctx.type}: ${what}`);
 }
 
-function isKnown(ctx: TypeContext, type: string): boolean {
-  return Object.hasOwn(ctx.definitions, type);
+function isKnown(ctx: TypeContext, type: unknown): type is string {
+  return typeof type === "string" && Object.hasOwn(ctx.definitions, type);
+}
+
+/**
+ * A referenced definition, or undefined when it is not a record. A null or
+ * mistyped definition is reported once, by the main loop for its own type;
+ * references to it just skip the checks that would need to read it.
+ */
+function referenced(ctx: TypeContext, type: string): ModelDefinition | undefined {
+  const def = ctx.definitions[type];
+  return isRecord(def) ? (def as ModelDefinition) : undefined;
 }
 
 /**
@@ -422,7 +433,11 @@ function collectFields(ctx: TypeContext): void {
  * identifier, must not collide with a data field of the same class, and must
  * be unique among the type's members.
  */
-function claimMember(ctx: TypeContext, kind: "getter" | "relation name", name: string, owner: string): void {
+function claimMember(ctx: TypeContext, kind: "getter" | "relation name", name: unknown, owner: string): void {
+  if (typeof name !== "string") {
+    problem(ctx, `${owner} ${kind} is missing or not a string`);
+    return;
+  }
   if (!IDENTIFIER.test(name)) problem(ctx, `${owner} ${kind} "${name}" is not a valid identifier`);
   else if (RESERVED_MEMBERS.has(name)) problem(ctx, `${owner} ${kind} "${name}" is a reserved name`);
   const field = ctx.fields.get(name);
@@ -443,6 +458,10 @@ function checkNameAndIndex(ctx: TypeContext): void {
 function checkModel(ctx: TypeContext): void {
   const { model } = ctx.def;
   if (model === undefined) return;
+  if (typeof model !== "string") {
+    problem(ctx, "model must be a string");
+    return;
+  }
   if (!IDENTIFIER.test(model)) problem(ctx, `model "${model}" is not a valid identifier`);
   else if (isReservedClassName(model)) problem(ctx, `model "${model}" is a reserved name`);
   const owner = ctx.models.get(model);
@@ -462,7 +481,7 @@ function checkPointers(ctx: TypeContext, property: string, pointers: Record<stri
     if (property === "foreignKeysArray" && field === ctx.def.index) {
       problem(ctx, `foreignKeysArray.${field} is the index field (the index must be a scalar)`);
     }
-    if (!isKnown(ctx, fk.objectType)) problem(ctx, `${property}.${field} points at unknown type "${fk.objectType}"`);
+    if (!isKnown(ctx, fk.objectType)) problem(ctx, `${property}.${field} points at unknown type "${String(fk.objectType)}"`);
     claimMember(ctx, "getter", fk.getter, `${property}.${field}`);
   }
 }
@@ -476,12 +495,15 @@ function checkRelatedObjectTypes(ctx: TypeContext): void {
     claimMember(ctx, "relation name", name, label);
     if (!checkEntry(ctx, label, rel)) continue;
     claimMember(ctx, "getter", rel.getter, label);
-    if (!isEmittable(rel.key)) problem(ctx, `${label}.key "${rel.key}" is not a valid identifier or is reserved`);
+    const keyOk = isEmittable(rel.key);
+    if (!keyOk) problem(ctx, `${label}.key "${String(rel.key)}" is not a valid identifier or is reserved`);
     if (!isKnown(ctx, rel.objectType)) {
-      problem(ctx, `${label}.objectType "${rel.objectType}" is not a known type`);
+      problem(ctx, `${label}.objectType "${String(rel.objectType)}" is not a known type`);
       continue;
     }
-    const childFk = own(ctx.definitions[rel.objectType]!.foreignKeys, rel.key);
+    const child = referenced(ctx, rel.objectType);
+    if (!child || !keyOk) continue; // the child (or the key) was already reported
+    const childFk = isRecord(child.foreignKeys) ? own(child.foreignKeys, rel.key) : undefined;
     if (!childFk) {
       problem(ctx, `${label}.key "${rel.key}" is not declared in ${rel.objectType}.foreignKeys (grouped index + events need it)`);
     } else if (childFk.objectType !== ctx.type) {
@@ -509,22 +531,28 @@ function checkHasManyEntry(ctx: TypeContext, name: string, hm: HasManyDefinition
   const otherType = hm.objectType;
   claimMember(ctx, "relation name", name, label);
   claimMember(ctx, "getter", hm.getter, label);
-  for (const key of [hm.thisKey, hm.otherKey]) {
-    if (!isEmittable(key)) problem(ctx, `${label}: join key "${key}" is not a valid identifier or is reserved`);
+  const keysOk = { thisKey: isEmittable(hm.thisKey), otherKey: isEmittable(hm.otherKey) };
+  for (const role of ["thisKey", "otherKey"] as const) {
+    if (!keysOk[role]) problem(ctx, `${label}: ${role} "${String(hm[role])}" is not a valid identifier or is reserved`);
   }
-  if (hm.thisKey === hm.otherKey) problem(ctx, `${label}: thisKey and otherKey are both "${hm.thisKey}"`);
+  if (keysOk.thisKey && keysOk.otherKey && hm.thisKey === hm.otherKey) {
+    problem(ctx, `${label}: thisKey and otherKey are both "${hm.thisKey}"`);
+  }
 
   const otherKnown = isKnown(ctx, otherType);
-  if (!otherKnown) problem(ctx, `${label}.objectType "${otherType}" is not a known type`);
+  if (!otherKnown) problem(ctx, `${label}.objectType "${String(otherType)}" is not a known type`);
   if (!isKnown(ctx, hm.through)) {
-    problem(ctx, `${label}.through "${hm.through}" is not a known type`);
+    problem(ctx, `${label}.through "${String(hm.through)}" is not a known type`);
     return; // nothing below can be checked without the join bucket
   }
-  const through = ctx.definitions[hm.through]!;
-  checkJoinKey(ctx, label, hm.through, through, hm.thisKey, ctx.type);
+  const through = referenced(ctx, hm.through);
+  if (!through) return; // a null/mistyped join bucket was already reported by its own type
+  if (keysOk.thisKey) checkJoinKey(ctx, label, hm.through, through, hm.thisKey, ctx.type);
   // with an unknown target, only check that the key is declared — comparing it to "tagz" would blame a correct join table;
   // identical keys were already reported above, and checking the same field twice would only repeat the message
-  if (hm.otherKey !== hm.thisKey) checkJoinKey(ctx, label, hm.through, through, hm.otherKey, otherKnown ? otherType : undefined);
+  if (keysOk.otherKey && hm.otherKey !== hm.thisKey) {
+    checkJoinKey(ctx, label, hm.through, through, hm.otherKey, otherKnown ? otherType : undefined);
+  }
   const belongsTo = through.belongsTo;
   if (!Array.isArray(belongsTo) || !belongsTo.includes(ctx.type)) {
     problem(ctx, `${label}: ${hm.through}.belongsTo must include "${ctx.type}" so association caches invalidate`);
@@ -611,32 +639,43 @@ export function isForeignKeyArrayValue(value: unknown): boolean {
 }
 
 /**
- * Checks one record's index field and declared foreign-key fields (single
- * and array). Returns the offending field names; empty means fine. The
- * cache calls this on write so a boolean, NaN or nested object in one of
- * those fields fails loudly instead of silently never notifying anyone.
- * The index is required and may not be null; foreign keys may be absent
- * (partial update) or null.
+ * Facts for custom definitions maps (tests, tooling). Cached only for FROZEN
+ * maps: a mutable map may gain a foreign key after the first call, and a
+ * cached entry would then let a bad value through.
  */
-/** Facts for custom definitions maps (tests, tooling), computed once per map and type. */
 const CUSTOM_FACTS = new WeakMap<Record<string, ModelDefinition>, Map<string, TypeFacts>>();
 
+/** Resolves the facts for `objectType`, with a clear error for anything that is not a usable definition. */
 function factsOf(objectType: string, definitions: Record<string, ModelDefinition> | undefined): TypeFacts {
   if (definitions === undefined) {
     if (!Object.hasOwn(TYPE_FACTS, objectType)) throw new TypeError(`unknown object type "${objectType}" (is it a singular push name?)`);
     return TYPE_FACTS[objectType as ObjectType];
   }
-  let perType = CUSTOM_FACTS.get(definitions);
-  if (!perType) CUSTOM_FACTS.set(definitions, (perType = new Map()));
-  let facts = perType.get(objectType);
-  if (!facts) {
-    if (!Object.hasOwn(definitions, objectType)) throw new TypeError(`unknown object type "${objectType}"`);
-    facts = factsFor(definitions[objectType]!);
+  if (!Object.hasOwn(definitions, objectType)) throw new TypeError(`unknown object type "${objectType}"`);
+  const cacheable = Object.isFrozen(definitions);
+  const cached = cacheable ? CUSTOM_FACTS.get(definitions)?.get(objectType) : undefined;
+  if (cached) return cached;
+
+  const def = definitions[objectType];
+  if (!isRecord(def) || typeof def.index !== "string") throw new TypeError(`definition for "${objectType}" is not a usable definition (object with a string index)`);
+  const facts = factsFor(def as ModelDefinition);
+  if (cacheable) {
+    let perType = CUSTOM_FACTS.get(definitions);
+    if (!perType) CUSTOM_FACTS.set(definitions, (perType = new Map()));
     perType.set(objectType, facts);
   }
   return facts;
 }
 
+/**
+ * Checks one record's index field and declared foreign-key fields (single
+ * and array). Returns the offending field names; empty means fine. The
+ * cache calls this on write so a boolean, NaN or nested object in one of
+ * those fields fails loudly instead of silently never notifying anyone.
+ * The index is required and may not be null; foreign keys may be absent
+ * (partial update) or null. Pass a definitions map to check against a
+ * schema other than the built-in one.
+ */
 export function invalidForeignKeyFields(objectType: ObjectType, record: Record<string, unknown>): string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): string[] {

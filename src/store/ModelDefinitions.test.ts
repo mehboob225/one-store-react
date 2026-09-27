@@ -245,7 +245,7 @@ describe("validateModelDefinitions", () => {
         'tasks: foreignKeysArray field "watcher ids" is not a valid identifier or is reserved',
         'comments: foreignKeys field "task-id" is not a valid identifier or is reserved',
         'users: relatedObjectType.comments.key "task-id" is not a valid identifier or is reserved',
-        'users: relatedObjectType.comments.key "task-id" points at tasks, not users',
+        // an invalid key is not also looked up in the child (review 6)
       ].sort(),
     );
   });
@@ -324,11 +324,9 @@ describe("validateModelDefinitions", () => {
         joins: { index: "id", belongsTo: ["tasks"] },
       }),
     ).toEqual([
-      'tasks: hasMany.tags: join key "constructor" is not a valid identifier or is reserved',
-      'tasks: hasMany.tags: join key "valueOf" is not a valid identifier or is reserved',
-      "tasks: hasMany.tags: joins does not declare foreignKeys.constructor",
-      "tasks: hasMany.tags: joins does not declare foreignKeys.valueOf",
-    ]);
+      'tasks: hasMany.tags: thisKey "constructor" is not a valid identifier or is reserved',
+      'tasks: hasMany.tags: otherKey "valueOf" is not a valid identifier or is reserved',
+    ]); // an invalid key is not also looked up in the join bucket
   });
 
   test("getters, model names and relation names may not be reserved words or class plumbing (review 3, finding 2)", () => {
@@ -489,6 +487,82 @@ describe("validateModelDefinitions", () => {
       "tasks: hasMany.tags: task_tags does not declare foreignKeys.task_id",
       'tasks: hasMany.tags: task_tags.belongsTo must include "tasks" so association caches invalidate',
     ]);
+  });
+
+  test("a missing getter, key or model is reported, never accepted as the name \"undefined\" (review 6, finding 1)", () => {
+    expect(withDefs({ tasks: { index: "id", foreignKeys: { owner_id: { objectType: "users" } as unknown as ForeignKeyDefinition } } })).toEqual([
+      "tasks: foreignKeys.owner_id getter is missing or not a string",
+    ]);
+    expect(
+      withDefs({
+        tasks: { index: "id", foreignKeys: { undefined: { objectType: "users", getter: "getU" } } },
+        users: { index: "id", model: "UserModel", relatedObjectType: { tasks: { objectType: "tasks", getter: "getTasks" } as unknown as RelatedObjectTypeDefinition } },
+      }),
+    ).toEqual(['users: relatedObjectType.tasks.key "undefined" is not a valid identifier or is reserved']);
+    expect(
+      withDefs({
+        tags: { index: "id", model: "TagModel" },
+        joins: { index: "id", foreignKeys: { undefined: { objectType: "tasks", getter: "getT" } }, belongsTo: ["tasks"] },
+        tasks: { index: "id", hasMany: { tags: { objectType: "tags", through: "joins", getter: "getTags" } as unknown as HasManyDefinition } },
+      }),
+    ).toEqual([
+      'tasks: hasMany.tags: thisKey "undefined" is not a valid identifier or is reserved',
+      'tasks: hasMany.tags: otherKey "undefined" is not a valid identifier or is reserved',
+    ]);
+    expect(withDefs({ things: { index: "id", model: null as unknown as string } })).toEqual(["things: model must be a string"]);
+    expect(withDefs({ things: { index: "id", foreignKeys: { x: { getter: "getX" } as unknown as ForeignKeyDefinition } } })).toEqual([
+      'things: foreignKeys.x points at unknown type "undefined"',
+    ]);
+  });
+
+  test("a null definition reached through a reference is reported once and never crashes the validator (review 6, finding 2)", () => {
+    expect(
+      validateModelDefinitions({
+        users: { index: "id", relatedObjectType: { tasks: { objectType: "tasks", key: "owner_id", getter: "getTasks" } } },
+        tasks: null as unknown as ModelDefinition,
+      }),
+    ).toEqual(["tasks: definition must be an object"]);
+    expect(
+      validateModelDefinitions({
+        tags: { index: "id" },
+        tasks: { index: "id", hasMany: { tags: { objectType: "tags", through: "joins", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } } },
+        joins: "nope" as unknown as ModelDefinition,
+      }),
+    ).toEqual(["joins: definition must be an object"]);
+    expect(
+      validateModelDefinitions({
+        tags: { index: "id" },
+        tasks: { index: "id", hasMany: { tags: { objectType: "tags", through: "joins", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } } },
+        joins: { index: "id", foreignKeys: "nope" as unknown as ModelDefinition["foreignKeys"], belongsTo: ["tasks"] },
+      }),
+    ).toEqual([
+      "tasks: hasMany.tags: joins does not declare foreignKeys.task_id",
+      "tasks: hasMany.tags: joins does not declare foreignKeys.tag_id",
+      "joins: foreignKeys must be an object",
+    ]);
+  });
+
+  test("the custom-map guard rejects unusable definitions clearly and caches facts only for frozen maps (review 6, findings 6, 7)", () => {
+    expect(() => invalidForeignKeyFields("x", { id: 1 }, { x: null as unknown as ModelDefinition })).toThrow(/definition for "x" is not a usable definition/);
+    expect(() => invalidForeignKeyFields("x", { id: 1 }, { x: { index: 5 as unknown as string } })).toThrow(/not a usable definition/);
+    expect(invalidForeignKeyFields("x", { id: 1, "0": true }, { x: { index: "id", foreignKeys: "nope" as unknown as ModelDefinition["foreignKeys"] } })).toEqual([]);
+
+    // mutable map: a foreign key added after the first call is seen by the next
+    const mutable: Record<string, ModelDefinition> = { tasks: { index: "id", foreignKeys: {} } };
+    expect(invalidForeignKeyFields("tasks", { id: 1, owner_id: NaN }, mutable)).toEqual([]);
+    mutable.tasks!.foreignKeys!.owner_id = { objectType: "users", getter: "getOwner" };
+    expect(invalidForeignKeyFields("tasks", { id: 1, owner_id: NaN }, mutable)).toEqual(["owner_id"]);
+
+    // frozen map: cached, and frozen means it cannot change anyway
+    const frozen = Object.freeze({ tasks: Object.freeze({ index: "id", foreignKeys: Object.freeze({ owner_id: { objectType: "users", getter: "getOwner" } }) }) }) as Record<string, ModelDefinition>;
+    expect(invalidForeignKeyFields("tasks", { id: 1, owner_id: NaN }, frozen)).toEqual(["owner_id"]);
+    expect(invalidForeignKeyFields("tasks", { id: 1, owner_id: 2 }, frozen)).toEqual([]);
+  });
+
+  test("newer built-ins and global functions are reserved class names too (review 6, finding 10)", () => {
+    for (const model of ["Float16Array", "SuppressedError", "DisposableStack", "parseInt", "isNaN", "encodeURIComponent", "escape"]) {
+      expect(withDefs({ things: { index: "id", model } })).toEqual([`things: model "${model}" is a reserved name`]);
+    }
   });
 
   test("the write guard rejects unknown and prototype-named types clearly, on both paths (review 5, finding 2)", () => {

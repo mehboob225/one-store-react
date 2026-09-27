@@ -29,7 +29,7 @@ shapes, or the factories (step 11) are the place to adapt.
 |---|---|
 | `ada@example.com` | `password` |
 | `grace@example.com` | `password` |
-| `alan@example.com` | `password` (on no project) |
+| `alan@example.com` | `password` (on no project; still a workspace member) |
 
 ## Endpoints
 
@@ -37,7 +37,7 @@ shapes, or the factories (step 11) are the place to adapt.
 |---|---|---|---|---|
 | POST | `/sign_in` | `{email, password}` (non-empty strings) | `{uuid, token, user}`, `400` on a bad body | — |
 | DELETE | `/sign_out` | — | `{ok: true}`; that session's sockets get `session_invalid` and close | — |
-| GET | `/users` | — | `{users: []}` — the users sharing a project with the caller (owners and members), caller included; fills the `users` bucket so `owner_id`, `member_ids`, `author_id` resolve without letting an account enumerate every account | — |
+| GET | `/users` | — | `{users: []}` — every workspace user as `id` and `name`; fills the `users` bucket so `owner_id`, `member_ids`, `assignee_id`, `author_id` always resolve. The demo is one workspace whose members see each other by name (the usual collaboration model); emails and settings never leave `current_user` | — |
 | GET | `/users/current` | — | `{user, current_user}` (`current_user` carries `settings`) | — |
 | PUT | `/users/current/settings` | `{settings}` (plain object) | `{current_user}` (settings merged), `400` otherwise | `update current_user` **to that user only** |
 | GET | `/projects` | — | `{projects: []}` (each with `owner_id`, `member_ids`) | — |

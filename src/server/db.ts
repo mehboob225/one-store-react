@@ -16,7 +16,6 @@ import {
 } from "./fixtures";
 import { MUTABLE_TASK_FIELDS, type MutableTaskField } from "./validation";
 
-/** What other users may see: no password, no settings. */
 /** What other users may see: id and name only — never email, password or settings. */
 export type PublicUser = Pick<UserRow, "id" | "name">;
 
@@ -71,18 +70,14 @@ export class Database {
   }
 
   /**
-   * The users the caller may know about: everyone who owns or is a member of
-   * a project the caller owns or is a member of (the caller included). Fills
-   * the `users` bucket so owner/member/author keys resolve, without letting
-   * any signed-in account enumerate every account in the system.
+   * Every workspace user, public representation (id and name). The demo is
+   * one workspace whose members can all see each other by name — the usual
+   * collaboration model — so owner, member, assignee and author keys always
+   * resolve. What must never leave `current_user` is email and settings, and
+   * `publicUser` guarantees that for every representation.
    */
-  listUsersSharingProjectsWith(userId: number): PublicUser[] {
-    const visible = new Set<number>([userId]);
-    for (const project of this.data.projects) {
-      const participants = [project.owner_id, ...project.member_ids];
-      if (participants.includes(userId)) for (const id of participants) visible.add(id);
-    }
-    return this.data.users.filter((u) => visible.has(u.id)).map(publicUser);
+  listUsers(): PublicUser[] {
+    return this.data.users.map(publicUser);
   }
 
   getUser(id: number): PublicUser | undefined {
