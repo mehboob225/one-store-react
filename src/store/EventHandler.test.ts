@@ -273,6 +273,18 @@ describe("DataEventHandler", () => {
       expect(keys).toEqual(["tasks/project_id/42"]);
     });
 
+    test("the index is read as an OWN property too: an inherited or accessor id is not an id (review 9, finding 2)", async () => {
+      const bus = new DataEventHandler();
+      const ids: unknown[] = [];
+      bus.subscribe({ objectType: "tasks" }, (b) => ids.push(...b.ids));
+      const inherited = Object.assign(Object.create({ id: 7 }) as Record<string, unknown>, { title: "x" });
+      const accessor = Object.defineProperty({ title: "y" } as Record<string, unknown>, "id", { get: () => 8, enumerable: true });
+      const own = { id: 9 };
+      bus.broadcast({ objectType: "tasks", action: "add", objects: [inherited, accessor, own] });
+      await tick();
+      expect(ids).toEqual([8, 9]); // an accessor defined on the object itself is an own property; an inherited id is not
+    });
+
     test("`previous` entries whose id is not in `objects` are ignored", async () => {
       const bus = new DataEventHandler();
       const batches: DataEventBatch[] = [];

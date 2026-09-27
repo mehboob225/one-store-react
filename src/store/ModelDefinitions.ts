@@ -45,8 +45,6 @@
 
 import { canonicalKey, isKeyValue } from "./canonicalKey";
 
-export { canonicalKey, isKeyValue };
-
 export interface ForeignKeyDefinition {
   /** The bucket the value points at. */
   objectType: string;
@@ -257,6 +255,8 @@ const RESERVED = new Set([
   // class / object plumbing
   "constructor", "prototype", "__proto__", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__",
   "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toString", "toLocaleString", "valueOf",
+  // names that change how every instance behaves: a thenable hangs `await`, toJSON rewrites serialisation
+  "then", "toJSON",
   // PassiveModel (step 8) instance API
   "initializeFromJson", "clone",
 ]);
@@ -640,9 +640,10 @@ export function assertValidModelDefinitions(definitions: Record<string, ModelDef
 }
 
 /**
- * What a single foreign-key field may hold: a non-empty string, a finite
- * number, or null/undefined. NaN, Infinity and "" would land an object in a
- * bucket nobody subscribes to, silently.
+ * What a single foreign-key field may hold: a key value as defined in
+ * canonicalKey.ts (a finite number or a non-empty, non-padded string), or
+ * null/undefined. NaN, Infinity, "" and " 1" would land an object in a bucket
+ * nobody subscribes to, silently.
  */
 export function isForeignKeyValue(value: unknown): boolean {
   // ids are whatever the server says (a string "1.0" is a different id from 1, not a typo);
@@ -697,19 +698,23 @@ export function invalidForeignKeyFields(objectType: ObjectType, record: Record<s
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): readonly string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): readonly string[] {
   const facts = factsOf(objectType, definitions);
+  // no closure and no array on the clean path: `bad` is created by the first problem
   let bad: string[] | undefined;
-  const flag = (field: string) => {
-    bad ??= [];
-    if (!bad.includes(field)) bad.push(field); // the index may also be a foreign key: report it once
-  };
-  if (!isKeyValue(own(record, facts.index))) flag(facts.index);
+  if (!isKeyValue(own(record, facts.index))) bad = [facts.index];
   for (const field of facts.foreignKeys) {
-    if (Object.hasOwn(record, field) && !isForeignKeyValue(record[field])) flag(field);
+    if (Object.hasOwn(record, field) && !isForeignKeyValue(record[field])) bad = addUnique(bad, field);
   }
   for (const field of facts.foreignKeyArrays) {
-    if (Object.hasOwn(record, field) && !isForeignKeyArrayValue(record[field])) flag(field);
+    if (Object.hasOwn(record, field) && !isForeignKeyArrayValue(record[field])) bad = addUnique(bad, field);
   }
   return bad ?? NO_BAD_FIELDS;
+}
+
+/** Appends `item` unless present (the index may also be a foreign key: report it once). */
+function addUnique(list: string[] | undefined, item: string): string[] {
+  if (list === undefined) return [item];
+  if (!list.includes(item)) list.push(item);
+  return list;
 }
 
 export function assertForeignKeyValues(objectType: ObjectType, record: Record<string, unknown>): void;

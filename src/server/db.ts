@@ -31,11 +31,8 @@ export interface NewTask {
 
 export type TaskPatch = Partial<Omit<TaskRow, "id" | "project_id" | "hash">> & { hash: string };
 
-export class ConflictError extends Error {
-  constructor(public readonly current: TaskRow) {
-    super("conflict");
-  }
-}
+/** Result of looking a task up for an update: the route maps each case to 404, 409 or a write. */
+export type TaskLookup = { kind: "missing" } | { kind: "conflict"; current: TaskRow } | { kind: "ok"; current: TaskRow };
 
 export class Database {
   private data: SeedData;
@@ -136,15 +133,25 @@ export class Database {
   }
 
   /**
-   * Applies only the mutable fields (see MUTABLE_TASK_FIELDS); `id`,
-   * `project_id` and `hash` can never be set by a caller.
-   * Throws ConflictError when `patch.hash` does not match the stored hash.
+   * The first step of an update: is the task there, and does the caller hold
+   * its current hash? Only the hash is needed to answer, so a route can send
+   * 404 or 409 (with the current row) before it validates anything else.
    */
-  updateTask(id: number, patch: TaskPatch): TaskRow | undefined {
+  findTaskForUpdate(id: number, hash: unknown): TaskLookup {
     const task = this.data.tasks.find((t) => t.id === id);
-    if (!task) return undefined;
-    if (patch.hash !== task.hash) throw new ConflictError(clone(task));
+    if (!task) return { kind: "missing" };
+    if (hash !== task.hash) return { kind: "conflict", current: clone(task) };
+    return { kind: "ok", current: clone(task) };
+  }
 
+  /**
+   * The second step: applies the mutable fields (see MUTABLE_TASK_FIELDS) to
+   * a task whose hash was verified by `findTaskForUpdate` and bumps the hash.
+   * `id`, `project_id` and `hash` can never be set by a caller.
+   */
+  applyTaskPatch(id: number, patch: Omit<TaskPatch, "hash">): TaskRow {
+    const task = this.data.tasks.find((t) => t.id === id);
+    if (!task) throw new Error(`applyTaskPatch: task ${id} vanished between lookup and write`);
     for (const field of MUTABLE_TASK_FIELDS) {
       if (field in patch) (task as Record<MutableTaskField, unknown>)[field] = patch[field];
     }

@@ -3,7 +3,6 @@ import {
   ModelDefinitions,
   assertForeignKeyValues,
   assertValidModelDefinitions,
-  canonicalKey,
   definitionFor,
   foreignKeyArrayNames,
   foreignKeyNames,
@@ -19,6 +18,7 @@ import {
   type ObjectType,
   type RelatedObjectTypeDefinition,
 } from "./ModelDefinitions";
+import { canonicalKey } from "./canonicalKey";
 
 describe("the real ModelDefinitions", () => {
   test("are internally consistent", () => {
@@ -615,6 +615,21 @@ describe("validateModelDefinitions", () => {
     ).toEqual(["users: relatedObjectType.tasks.cascadeDelete must be a boolean"]);
   });
 
+  test("`then` and `toJSON` are reserved everywhere a name becomes a member or field (review 9, finding 6)", () => {
+    expect(withDefs({ things: { index: "id", foreignKeys: { then: { objectType: "users", getter: "getThen" } } } })).toEqual([
+      'things: foreignKeys field "then" is not a valid identifier or is reserved',
+    ]);
+    expect(withDefs({ things: { index: "id", foreignKeys: { x: { objectType: "users", getter: "toJSON" } } } })).toEqual([
+      'things: foreignKeys.x getter "toJSON" is a reserved name',
+    ]);
+    expect(
+      withDefs({
+        tasks: { index: "id", foreignKeys: { owner_id: { objectType: "users", getter: "getOwner" } } },
+        users: { index: "id", model: "UserModel", relatedObjectType: { then: { objectType: "tasks", key: "owner_id", getter: "getTasks" } } },
+      }),
+    ).toEqual(['users: relatedObjectType.then relation name "then" is a reserved name']);
+  });
+
   test("newer built-ins and global functions are reserved class names too (review 6, finding 10)", () => {
     for (const model of ["Float16Array", "SuppressedError", "DisposableStack", "parseInt", "isNaN", "encodeURIComponent", "escape"]) {
       expect(withDefs({ things: { index: "id", model } })).toEqual([`things: model "${model}" is a reserved name`]);
@@ -704,9 +719,7 @@ describe("foreign-key values", () => {
     expect(invalidForeignKeyFields("tasks", { id: NaN, project_id: NaN })).toEqual(["id", "project_id"]);
   });
 
-  test("canonicalKey is the one string form for map keys, shared with the event bus (review 3 finding 4, review 4 finding 8)", async () => {
-    const shared = await import("./canonicalKey");
-    expect(shared.canonicalKey).toBe(canonicalKey);
+  test("canonicalKey is the one string form for map keys, imported from its own module (review 3 finding 4, review 4 finding 8, review 9 finding 7)", () => {
     expect(canonicalKey(1)).toBe("1");
     expect(canonicalKey("1")).toBe("1");
     expect(canonicalKey("7-3")).toBe("7-3");
