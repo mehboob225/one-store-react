@@ -26,6 +26,13 @@ Resolution order per endpoint: `BUN_PUBLIC_API_URL` / `BUN_PUBLIC_SOCK_URL` env 
 Never hardcode a URL elsewhere. Every variable is documented in `.env.example`;
 copy it to `.env` (gitignored, auto-loaded by Bun).
 
+## Authentication
+
+`src/auth/AuthenticationService.ts` owns credentials (`uuid:token`), persisted in
+localStorage and cached in memory. It uses plain `fetch` and never writes to the store.
+`handleLogout()` wipes every `_state_*` key (persisted UI atoms). Persisted UI state
+must use that prefix.
+
 ## Conventions
 
 - Components never fetch and never hold server state; they declare loaders and read the store.
