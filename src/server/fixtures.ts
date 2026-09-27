@@ -28,6 +28,8 @@ export interface ProjectRow {
   id: number;
   name: string;
   owner_id: number;
+  /** Users on the project (an id array: exercises `foreignKeysArray`). */
+  member_ids: number[];
   created_at: string;
 }
 
@@ -76,8 +78,8 @@ export function seed(): SeedData {
       { id: 2, name: "Grace Hopper", email: "grace@example.com", password: "password", settings: {} },
     ],
     projects: [
-      { id: 1, name: "Analytical Engine", owner_id: 1, created_at: "2026-09-01T09:00:00Z" },
-      { id: 2, name: "COBOL Compiler", owner_id: 2, created_at: "2026-09-10T09:00:00Z" },
+      { id: 1, name: "Analytical Engine", owner_id: 1, member_ids: [1, 2], created_at: "2026-09-01T09:00:00Z" },
+      { id: 2, name: "COBOL Compiler", owner_id: 2, member_ids: [2], created_at: "2026-09-10T09:00:00Z" },
     ],
     tasks: [
       { id: 1, project_id: 1, assignee_id: 1, title: "Design the mill", status: "done", due_on: "2026-09-15", hash: "t1-1" },
