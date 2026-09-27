@@ -87,8 +87,27 @@ describe("resolveDomainConfiguration", () => {
 });
 
 describe("DomainConfiguration singleton", () => {
-  test("resolves to same-origin defaults under the test origin with no config", () => {
-    // test/setup.ts registers happy-dom at http://localhost:3000
-    expect(DomainConfiguration).toEqual({ api: "/api/", sock: "ws://localhost:3000/push" });
+  // The singleton reads the real environment at import time, and `bun test`
+  // auto-loads `.env`, so this test must not assume BUN_PUBLIC_* are unset.
+  // It checks the wiring: the singleton equals the resolver fed with the live
+  // env, the live window injection and the real window location.
+  test("is the resolver applied to the live environment and window", () => {
+    expect(DomainConfiguration).toEqual(
+      resolveDomainConfiguration({
+        env: {
+          BUN_PUBLIC_API_URL: process.env.BUN_PUBLIC_API_URL,
+          BUN_PUBLIC_SOCK_URL: process.env.BUN_PUBLIC_SOCK_URL,
+        },
+        injected: window.__APP_CONFIG__,
+        location: window.location,
+      }),
+    );
+  });
+
+  test("reads the test origin from window.location", () => {
+    // test/setup.ts registers happy-dom at http://localhost:3000; with no env
+    // override the sock must be derived from that origin.
+    if (!process.env.BUN_PUBLIC_SOCK_URL) expect(DomainConfiguration.sock).toBe("ws://localhost:3000/push");
+    else expect(DomainConfiguration.sock).toMatch(/^wss?:\/\//);
   });
 });
