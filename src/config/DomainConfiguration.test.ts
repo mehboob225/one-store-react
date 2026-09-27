@@ -108,6 +108,6 @@ describe("DomainConfiguration singleton", () => {
     // test/setup.ts registers happy-dom at http://localhost:3000; with no env
     // override the sock must be derived from that origin.
     if (!process.env.BUN_PUBLIC_SOCK_URL) expect(DomainConfiguration.sock).toBe("ws://localhost:3000/push");
-    else expect(DomainConfiguration.sock).toMatch(/^wss?:\/\//);
+    else expect(DomainConfiguration.sock).toMatch(/^wss?:\/\//i);
   });
 });
