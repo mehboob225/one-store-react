@@ -78,8 +78,13 @@ interface Entry<P> {
  * stability (entries added meanwhile wait for the next delivery) and skips
  * entries removed from `live` during the delivery.
  */
-function deliver<P>(live: ReadonlySet<Entry<P>>, payload: P, onError: ListenerErrorHandler, context: { key?: string }): void {
-  const snapshot = Array.from(live);
+function deliver<P>(
+  live: ReadonlySet<Entry<P>>,
+  payload: P,
+  onError: ListenerErrorHandler,
+  context: { key?: string },
+  snapshot: readonly Entry<P>[] = Array.from(live),
+): void {
   for (const entry of snapshot) {
     if (!live.has(entry)) continue; // unsubscribed during this delivery
     try {
@@ -163,26 +168,47 @@ export type BroadcastInput =
   /** `objects` must be the STORED objects (with their foreign keys), never id-only stubs. */
   | (BroadcastBase & { action: "remove"; objects: readonly Row[] });
 
+/** A validated selector. Ids and values are in their canonical string form. */
+type Resolved =
+  | { kind: "bucket"; objectType: string; label: string }
+  | { kind: "id"; objectType: string; id: string; label: string }
+  | { kind: "fk"; objectType: string; keyName: string; value: string; label: string };
+
 /**
- * Human-readable label for a selector; also validates it. Defined values
- * decide the shape, so an id selector that also carries `keyName: undefined`
- * is an id selector. A selector whose only discriminator is present but
- * undefined throws: it would type-check (it matches the bare bucket shape)
- * and then never fire. Subscribe conditionally instead.
+ * The one place a selector's shape is decided. Non-null values decide the
+ * shape, so an id selector that also carries `keyName: undefined` is an id
+ * selector. Everything that would type-check (or slip in at runtime) and then
+ * never fire throws instead: a lone undefined/null discriminator, a non-scalar
+ * id or key, half a foreign-key selector, or an id together with a foreign key.
+ * Subscribe conditionally instead.
  */
-export function eventKey(selector: DataEventSelector): string {
-  const { objectType, id, keyName, key } = selector as { objectType: string; id?: IndexValue; keyName?: string; key?: IndexValue };
-  if (keyName !== undefined || key !== undefined) {
+function resolve(selector: DataEventSelector): Resolved {
+  const { objectType, id, keyName, key } = selector as { objectType: string; id?: unknown; keyName?: unknown; key?: unknown };
+  const hasId = id != null;
+  const hasForeignKey = keyName != null || key != null;
+  if (hasId && hasForeignKey) {
+    throw new TypeError(`eventKey: selector for "${objectType}" has both an id and a foreign key; pick one`);
+  }
+  if (hasForeignKey) {
     if (typeof keyName !== "string" || !isIndexValue(key)) {
-      throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key`);
+      throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key (a string or number)`);
     }
-    return `${objectType}/${keyName}/${String(key)}`;
+    const value = String(key);
+    return { kind: "fk", objectType, keyName, value, label: `${objectType}/${keyName}/${value}` };
   }
-  if (id !== undefined) return `${objectType}/${String(id)}`;
+  if (hasId) {
+    if (!isIndexValue(id)) throw new TypeError(`eventKey: selector for "${objectType}" needs a string or number id`);
+    return { kind: "id", objectType, id: String(id), label: `${objectType}/${String(id)}` };
+  }
   if ("id" in selector || "key" in selector || "keyName" in selector) {
-    throw new TypeError(`eventKey: selector for "${objectType}" has an undefined id; use { objectType } for the bucket`);
+    throw new TypeError(`eventKey: selector for "${objectType}" has an undefined id or key; use { objectType } for the bucket`);
   }
-  return objectType;
+  return { kind: "bucket", objectType, label: objectType };
+}
+
+/** Human-readable label for a selector; also validates it (see `resolve`). */
+export function eventKey(selector: DataEventSelector): string {
+  return resolve(selector).label;
 }
 
 type Target = Set<Entry<DataEventBatch>>;
@@ -213,13 +239,14 @@ export class DataEventHandler {
 
   /** Subscribes to a selector (bucket, object, or foreign-key value). Each call is its own subscription. */
   subscribe(selector: DataEventSelector, listener: DataEventListener): Unsubscribe {
-    eventKey(selector); // validates
+    // Resolved once: unsubscribe must not re-read a selector the caller may have mutated since.
+    const resolved = resolve(selector);
     const entry: Entry<DataEventBatch> = { listener };
-    const target = this.targetFor(selector, true)!;
+    const target = this.targetFor(resolved, true)!;
     target.add(entry);
     return () => {
       if (!target.delete(entry)) return; // already unsubscribed
-      if (target.size === 0) this.prune(selector);
+      if (target.size === 0) this.prune(resolved);
     };
   }
 
@@ -233,30 +260,26 @@ export class DataEventHandler {
     if (!type) return; // nobody listens to this type: do nothing at all
 
     const { objectType, objects, index = "id", foreignKeys = [] } = input;
-    const previousById = input.action === "update" && foreignKeys.length > 0 ? indexById(input.previous, index) : undefined;
-    let enqueued = false;
+    // Declared foreign keys somebody watches on this type; the others are never read.
+    const watchedForeignKeys = foreignKeys.flatMap((fk) => {
+      const values = type.fks.get(fk);
+      return values ? [{ fk, values }] : [];
+    });
+    const previousById = input.action === "update" && watchedForeignKeys.length > 0 ? indexById(input.previous, index) : undefined;
 
     for (const object of objects) {
       const id = object[index];
       if (!isIndexValue(id)) continue;
       const canon = String(id);
 
-      if (type.bucket.size > 0) enqueued = this.enqueue(type.bucket, objectType, objectType, id) || enqueued;
+      if (type.bucket.size > 0) this.enqueue(type.bucket, objectType, objectType, id);
 
       const byId = type.ids.get(canon);
-      if (byId) enqueued = this.enqueue(byId, `${objectType}/${canon}`, objectType, id) || enqueued;
+      if (byId) this.enqueue(byId, `${objectType}/${canon}`, objectType, id);
 
-      if (type.fks.size > 0) {
-        const before = previousById?.get(canon);
-        for (const fk of foreignKeys) {
-          const values = type.fks.get(fk);
-          if (!values) continue; // nobody watches this foreign key on this type: never read it
-          enqueued = this.enqueueForeignKey(values, objectType, fk, id, object, before) || enqueued;
-        }
-      }
+      const before = previousById?.get(canon);
+      for (const { fk, values } of watchedForeignKeys) this.enqueueForeignKey(values, objectType, fk, id, object, before);
     }
-
-    if (enqueued) this.scheduleFlush();
   }
 
   /**
@@ -284,7 +307,7 @@ export class DataEventHandler {
 
   /** Number of listeners for a selector (or in total). Mostly for tests and diagnostics. */
   listenerCount(selector?: DataEventSelector): number {
-    if (selector) return this.targetFor(selector, false)?.size ?? 0;
+    if (selector) return this.targetFor(resolve(selector), false)?.size ?? 0;
     let total = 0;
     for (const type of this.types.values()) {
       total += type.bucket.size;
@@ -301,36 +324,42 @@ export class DataEventHandler {
 
   // ---- internals ----------------------------------------------------------
 
-  private targetFor(selector: DataEventSelector, create: boolean): Target | undefined {
-    let type = this.types.get(selector.objectType);
+  private targetFor(resolved: Resolved, create: boolean): Target | undefined {
+    let type = this.types.get(resolved.objectType);
     if (!type) {
       if (!create) return undefined;
-      this.types.set(selector.objectType, (type = { bucket: new Set(), ids: new Map(), fks: new Map() }));
+      type = { bucket: new Set(), ids: new Map(), fks: new Map() };
+      this.types.set(resolved.objectType, type);
     }
-    if ("keyName" in selector && selector.keyName !== undefined) {
-      let values = type.fks.get(selector.keyName);
-      if (!values) {
-        if (!create) return undefined;
-        type.fks.set(selector.keyName, (values = new Map()));
+    switch (resolved.kind) {
+      case "bucket":
+        return type.bucket;
+      case "id":
+        return getOrCreate(type.ids, resolved.id, create);
+      case "fk": {
+        let values = type.fks.get(resolved.keyName);
+        if (!values) {
+          if (!create) return undefined;
+          values = new Map();
+          type.fks.set(resolved.keyName, values);
+        }
+        return getOrCreate(values, resolved.value, create);
       }
-      return getOrCreate(values, String(selector.key), create);
     }
-    if ("id" in selector && selector.id !== undefined) return getOrCreate(type.ids, String(selector.id), create);
-    return type.bucket;
   }
 
   /** Drops empty containers after the last unsubscribe so `types` stays small. */
-  private prune(selector: DataEventSelector): void {
-    const type = this.types.get(selector.objectType);
+  private prune(resolved: Resolved): void {
+    const type = this.types.get(resolved.objectType);
     if (!type) return;
-    if ("keyName" in selector && selector.keyName !== undefined) {
-      const values = type.fks.get(selector.keyName);
-      if (values?.get(String(selector.key))?.size === 0) values.delete(String(selector.key));
-      if (values?.size === 0) type.fks.delete(selector.keyName);
-    } else if ("id" in selector && selector.id !== undefined) {
-      if (type.ids.get(String(selector.id))?.size === 0) type.ids.delete(String(selector.id));
+    if (resolved.kind === "fk") {
+      const values = type.fks.get(resolved.keyName);
+      if (values?.get(resolved.value)?.size === 0) values.delete(resolved.value);
+      if (values?.size === 0) type.fks.delete(resolved.keyName);
+    } else if (resolved.kind === "id") {
+      if (type.ids.get(resolved.id)?.size === 0) type.ids.delete(resolved.id);
     }
-    if (type.bucket.size === 0 && type.ids.size === 0 && type.fks.size === 0) this.types.delete(selector.objectType);
+    if (type.bucket.size === 0 && type.ids.size === 0 && type.fks.size === 0) this.types.delete(resolved.objectType);
   }
 
   /**
@@ -338,31 +367,35 @@ export class DataEventHandler {
    * missing the field, the bucket `previous` says it is in) and — when the
    * value changed — the bucket it left.
    */
-  private enqueueForeignKey(values: Map<string, Target>, objectType: string, fk: string, id: IndexValue, object: Row, before: Row | undefined): boolean {
+  private enqueueForeignKey(values: Map<string, Target>, objectType: string, fk: string, id: IndexValue, object: Row, before: Row | undefined): void {
     const present = fk in object;
     const current = present ? object[fk] : before?.[fk];
-    let enqueued = false;
+    this.enqueueForeignValue(values, objectType, fk, current, id);
 
-    if (isIndexValue(current)) {
-      const target = values.get(String(current));
-      if (target) enqueued = this.enqueue(target, `${objectType}/${fk}/${String(current)}`, objectType, id) || enqueued;
+    // Only a field present in the write can have moved the object out of its old bucket.
+    const old = present ? before?.[fk] : undefined;
+    if (isIndexValue(old) && (!isIndexValue(current) || String(old) !== String(current))) {
+      this.enqueueForeignValue(values, objectType, fk, old, id);
     }
-    if (present && before !== undefined) {
-      const old = before[fk];
-      if (isIndexValue(old) && (!isIndexValue(current) || String(old) !== String(current))) {
-        const target = values.get(String(old));
-        if (target) enqueued = this.enqueue(target, `${objectType}/${fk}/${String(old)}`, objectType, id) || enqueued;
-      }
-    }
-    return enqueued;
   }
 
-  private enqueue(target: Target, key: string, objectType: string, id: IndexValue): boolean {
+  /** Queues `id` for the subscribers of `fk = value`, if `value` is a scalar somebody watches. */
+  private enqueueForeignValue(values: Map<string, Target>, objectType: string, fk: string, value: unknown, id: IndexValue): void {
+    if (!isIndexValue(value)) return;
+    const target = values.get(String(value));
+    if (target) this.enqueue(target, `${objectType}/${fk}/${String(value)}`, objectType, id);
+  }
+
+  /** Adds `id` to the target's pending batch and makes sure a flush is scheduled. */
+  private enqueue(target: Target, key: string, objectType: string, id: IndexValue): void {
     let entry = this.pending.get(target);
-    if (!entry) this.pending.set(target, (entry = { key, objectType, ids: new Map() }));
+    if (!entry) {
+      entry = { key, objectType, ids: new Map() };
+      this.pending.set(target, entry);
+    }
     const canon = String(id);
     if (!entry.ids.has(canon)) entry.ids.set(canon, id);
-    return true;
+    this.scheduleFlush();
   }
 
   private deliverPending(): void {
@@ -373,14 +406,19 @@ export class DataEventHandler {
     const batches = this.pending;
     this.pending = new Map();
 
-    for (const [target, entry] of batches) {
-      if (target.size === 0) continue;
+    // Snapshot every target's subscriptions before calling anyone: a listener
+    // that an earlier target's listener subscribes to a later target must wait
+    // for the next pass, like one subscribed to the target being delivered.
+    const work = [...batches].map(([target, entry]) => ({ target, entry, snapshot: Array.from(target) }));
+
+    for (const { target, entry, snapshot } of work) {
+      if (snapshot.length === 0) continue;
       const batch: DataEventBatch = Object.freeze({
         key: entry.key,
         objectType: entry.objectType,
         ids: Object.freeze([...entry.ids.values()]),
       });
-      deliver(target, batch, this.onListenerError, { key: entry.key });
+      deliver(target, batch, this.onListenerError, { key: entry.key }, snapshot);
     }
   }
 
@@ -395,7 +433,10 @@ export class DataEventHandler {
 
 function getOrCreate(map: Map<string, Target>, key: string, create: boolean): Target | undefined {
   let target = map.get(key);
-  if (!target && create) map.set(key, (target = new Set()));
+  if (!target && create) {
+    target = new Set();
+    map.set(key, target);
+  }
   return target;
 }
 

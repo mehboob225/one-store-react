@@ -96,6 +96,14 @@ describe("eventKey", () => {
     const bus = new DataEventHandler();
     expect(() => bus.subscribe({ objectType: "tasks", id: undefined as unknown as number }, () => {})).toThrow(TypeError);
   });
+
+  test("selectors that would never fire throw: null or non-scalar id/key, and id together with a foreign key", () => {
+    expect(() => eventKey({ objectType: "tasks", id: null } as never)).toThrow(/undefined id/);
+    expect(() => eventKey({ objectType: "tasks", id: {} } as never)).toThrow(/string or number id/);
+    expect(() => eventKey({ objectType: "tasks", keyName: "project_id", key: {} } as never)).toThrow(/both keyName and key/);
+    expect(() => eventKey({ objectType: "tasks", id: 7, keyName: "project_id", key: 1 } as never)).toThrow(/both an id and a foreign key/);
+    expect(eventKey({ objectType: "tasks", id: 7, keyName: null, key: null } as never)).toBe("tasks/7");
+  });
 });
 
 describe("DataEventHandler", () => {
@@ -334,6 +342,27 @@ describe("DataEventHandler", () => {
       bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 1, project_id: 1 }], foreignKeys: ["project_id"] });
       expect(bus.pendingKeys).toEqual([]);
     });
+
+    test("unsubscribe prunes the target it subscribed to, even if the caller mutated the selector since", () => {
+      const bus = new DataEventHandler();
+      const selector = { objectType: "tasks", id: 7 };
+      const off = bus.subscribe(selector, () => {});
+      selector.id = 8;
+      off();
+      bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 7 }] });
+      expect(bus.pendingKeys).toEqual([]);
+    });
+
+    test("with no foreign-key listeners, an update never reads `previous`", () => {
+      const bus = new DataEventHandler();
+      bus.subscribe({ objectType: "tasks" }, () => {});
+      let reads = 0;
+      const previous = new Proxy({ id: 1, project_id: 1 } as Record<string, unknown>, {
+        get: (t, p, r) => (reads++, Reflect.get(t, p, r)),
+      });
+      bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }], previous: [previous], foreignKeys: ["project_id"] });
+      expect(reads).toBe(0);
+    });
   });
 
   describe("delivery", () => {
@@ -359,6 +388,19 @@ describe("DataEventHandler", () => {
       bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 1 }] });
       await tick();
       expect(calls).toEqual(["a"]);
+    });
+
+    test("a listener subscribed during a pass is not called by it, even on a target delivered later in that pass", async () => {
+      const bus = new DataEventHandler();
+      const calls: string[] = [];
+      bus.subscribe({ objectType: "tasks" }, () => {
+        calls.push("bucket");
+        bus.subscribe({ objectType: "tasks", id: 7 }, () => calls.push("late"));
+      });
+      bus.subscribe({ objectType: "tasks", id: 7 }, () => calls.push("existing"));
+      bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 7 }] });
+      await tick();
+      expect(calls).toEqual(["bucket", "existing"]);
     });
 
     test("the same function subscribed twice to one selector is two subscriptions", async () => {
