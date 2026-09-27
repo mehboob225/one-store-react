@@ -18,6 +18,14 @@ Each step is one PR; every PR must keep `bun run check`, `bun test` and
 - `bun test` — unit + component tests (happy-dom is preloaded via `test/setup.ts`)
 - `bun run build` — static production build to `dist/`
 
+## Configuration
+
+Backend endpoints come from `src/config/DomainConfiguration.ts` (`api`, `sock`).
+Resolution order per endpoint: `BUN_PUBLIC_API_URL` / `BUN_PUBLIC_SOCK_URL` env →
+`window.__APP_CONFIG__` → `HOSTNAME_MAP` → same-origin (`/api/`, `ws(s)://host/push`).
+Never hardcode a URL elsewhere. Every variable is documented in `.env.example`;
+copy it to `.env` (gitignored, auto-loaded by Bun).
+
 ## Conventions
 
 - Components never fetch and never hold server state; they declare loaders and read the store.
