@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { seed } from "./fixtures";
 import { createMockServer, type MockServer } from "./index";
 
 let mock: MockServer;
@@ -269,10 +270,16 @@ describe("projects and tasks", () => {
       expect((await put(999, task)).status).toBe(404);
     }
     // 2. malformed: no task object, or no string hash — a broken request, never a conflict
-    for (const task of [{}, "nope", null, { hash: 5 }, { status: "done" }]) {
+    for (const [task, message] of [
+      [{}, "task.hash must be a string"],
+      [{ hash: 5 }, "task.hash must be a string"],
+      [{ status: "done" }, "task.hash must be a string"],
+      ["nope", "task must be an object"],
+      [null, "task must be an object"],
+    ] as const) {
       const res = await put(1, task);
       expect(res.status).toBe(400);
-      expect(((await res.json()) as { error: string }).error).toContain("string hash");
+      expect(((await res.json()) as { error: string }).error).toBe(message);
     }
     // 3. stale hash: 409 carrying the current task, even with a bad body or assignee
     for (const task of [{ hash: "stale", assignee_id: 3 }, { hash: "stale", status: "bogus" }, { hash: "stale" }]) {
@@ -289,12 +296,41 @@ describe("projects and tasks", () => {
     expect((await put(1, { hash: "t1-1", status: "todo" })).status).toBe(409);
   });
 
-  test("the assignee rule is enforced by the data layer, not only by the routes", () => {
+  test("validation and the assignee rule are enforced by the data layer, not only by the routes", () => {
     expect(mock.db.createTask(1, { title: "x", assignee_id: 3 })).toEqual({ kind: "invalid", error: expect.stringContaining("owner or a project member") });
     expect(mock.db.createTask(1, { title: "x", assignee_id: 1 }).kind).toBe("created"); // the owner, who need not be in member_ids
+    expect(mock.db.createTask(1, "nope")).toEqual({ kind: "invalid", error: "task must be an object" });
+    expect(mock.db.createTask(1, { title: "" })).toEqual({ kind: "invalid", error: "task.title must be a non-empty string" });
     expect(mock.db.createTask(999, { title: "x" }).kind).toBe("missing");
+    expect(mock.db.updateTask(1, { hash: "t1-1", status: "bogus" })).toMatchObject({ kind: "invalid" });
+    expect(mock.db.updateTask(1, "nope")).toEqual({ kind: "malformed", error: "task must be an object" });
     expect(mock.db.isProjectParticipant(1, 3)).toBe(false);
     expect(mock.db.isProjectParticipant(2, 1)).toBe(true);
+  });
+
+  test("an unchanged assignee never blocks an unrelated edit, even after that user left the project (review 11, finding 1)", async () => {
+    // Ada (1) is assigned task 5 in project 2; take her off the project's members
+    const data = seed();
+    data.projects.find((p) => p.id === 2)!.member_ids = [2];
+    mock.db.reset(data);
+    expect(mock.db.isProjectParticipant(2, 1)).toBe(false);
+
+    const put = (task: object) => api("/tasks/5", { method: "PUT", body: JSON.stringify({ task }) });
+    // saving the whole task back with the same assignee: fine
+    let res = await put({ hash: "t5-1", title: "renamed", assignee_id: 1 });
+    expect(res.status).toBe(200);
+    const { hash } = ((await res.json()) as { task: { hash: string } }).task;
+    // changing to another non-participant: refused
+    expect((await put({ hash, assignee_id: 3 })).status).toBe(400);
+    // re-assigning the same non-participant explicitly is not a change either
+    expect((await put({ hash, assignee_id: 1, status: "done" })).status).toBe(200);
+  });
+
+  test("the import route reports what was written (review 11, finding 2)", async () => {
+    const body = (await (await api("/projects/2/tasks/import", { method: "POST" })).json()) as { imported: number };
+    const tasks = ((await (await api("/projects/2/tasks")).json()) as { tasks: { title: string }[] }).tasks;
+    expect(body.imported).toBe(tasks.filter((t) => t.title.startsWith("Imported:")).length);
+    expect((await api("/projects/999/tasks/import", { method: "POST" })).status).toBe(404);
   });
 
   test("POST /projects/:id/tasks/import returns only a count", async () => {

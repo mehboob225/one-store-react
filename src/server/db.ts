@@ -14,7 +14,7 @@ import {
   type TaskTagRow,
   type UserRow,
 } from "./fixtures";
-import { MUTABLE_TASK_FIELDS, isPlainObject, type MutableTaskField } from "./validation";
+import { MUTABLE_TASK_FIELDS, validateNewTask, validateTaskEnvelope, validateTaskFields, type MutableTaskField } from "./validation";
 
 /** What other users may see: id and name only — never email, password or settings. */
 export type PublicUser = Pick<UserRow, "id" | "name">;
@@ -29,21 +29,19 @@ export interface NewTask {
   due_on?: string | null;
 }
 
-export type TaskPatch = Partial<Omit<TaskRow, "id" | "project_id" | "hash">> & { hash: string };
+/** The fields a client may change on a task. `id`, `project_id` and `hash` are server-owned. */
+export type TaskFields = Partial<Omit<TaskRow, "id" | "project_id" | "hash">>;
 
-/** The caller's validation of an update body, run by `updateTask` after the hash check. */
-export type TaskPatchValidation = { ok: true; patch: Omit<TaskPatch, "hash"> } | { ok: false; error: string };
-
-/** Outcome of `createTask`. */
+/** Outcome of `createTask`, in check order: missing → 404, invalid → 400. */
 export type CreateOutcome = { kind: "missing" } | { kind: "invalid"; error: string } | { kind: "created"; task: TaskRow };
 
 /**
- * Outcome of `updateTask`, in the order the checks run — the route maps each
- * to a status: missing → 404, malformed → 400, conflict → 409, invalid → 400.
+ * Outcome of `updateTask`, in check order — the route maps each to a status:
+ * missing → 404, malformed → 400, conflict → 409, invalid → 400.
  */
 export type UpdateOutcome =
   | { kind: "missing" }
-  | { kind: "malformed" }
+  | { kind: "malformed"; error: string }
   | { kind: "conflict"; current: TaskRow }
   | { kind: "invalid"; error: string }
   | { kind: "updated"; task: TaskRow };
@@ -144,12 +142,21 @@ export class Database {
     return project !== undefined && (project.owner_id === userId || project.member_ids.includes(userId));
   }
 
+  hasProject(id: number): boolean {
+    return this.data.projects.some((p) => p.id === id);
+  }
+
   /**
-   * Creates a task. The assignee rule is enforced here, next to the write,
-   * so every writer (routes, imports, tests) gets it.
+   * Creates a task from an untrusted body, in one step: the project must
+   * exist, the body must validate, and an assignee must be an owner or
+   * member. Validation and the assignee rule live here, next to the write,
+   * so every writer (routes, imports, tests) gets them.
    */
-  createTask(projectId: number, input: NewTask): CreateOutcome {
-    if (!this.data.projects.some((p) => p.id === projectId)) return { kind: "missing" };
+  createTask(projectId: number, body: unknown): CreateOutcome {
+    if (!this.hasProject(projectId)) return { kind: "missing" };
+    const validated = validateNewTask(body);
+    if (!validated.ok) return { kind: "invalid", error: validated.error };
+    const input: NewTask = validated.value;
     if (input.assignee_id != null && !this.isProjectParticipant(projectId, input.assignee_id)) {
       return { kind: "invalid", error: ASSIGNEE_RULE };
     }
@@ -168,31 +175,35 @@ export class Database {
   }
 
   /**
-   * Updates a task in ONE synchronous step — optimistic locking depends on
-   * nothing happening between the hash check and the write:
-   *   1. the task must exist                                → missing
-   *   2. `body` must be an object with a string `hash`     → malformed
-   *   3. the hash must be the current one                   → conflict (with the current row)
-   *   4. `validate(body)` must accept the field values,
-   *      and an assignee must be an owner or member         → invalid
-   *   5. the mutable fields are applied and the hash bumped → updated
-   * `id`, `project_id` and `hash` can never be set by a caller.
+   * Updates a task from an untrusted body in ONE synchronous step — optimistic
+   * locking depends on nothing happening between the hash check and the write:
+   *   1. the task must exist                                       → missing
+   *   2. the envelope: an object with a string `hash`             → malformed
+   *   3. the hash must be the current one                          → conflict (with the current row)
+   *   4. the field values must validate, and a CHANGED assignee
+   *      must be an owner or member                                → invalid
+   *   5. the mutable fields are applied and the hash bumped        → updated
+   * `id`, `project_id` and `hash` can never be set by a caller. The assignee
+   * rule applies only to a change: saving a task back with its existing
+   * assignee must not fail because that user has since left the project.
    */
-  updateTask(id: number, body: unknown, validate: (body: Record<string, unknown>) => TaskPatchValidation): UpdateOutcome {
+  updateTask(id: number, body: unknown): UpdateOutcome {
     const task = this.data.tasks.find((t) => t.id === id);
     if (!task) return { kind: "missing" };
-    if (!isPlainObject(body) || typeof body.hash !== "string") return { kind: "malformed" };
-    if (body.hash !== task.hash) return { kind: "conflict", current: clone(task) };
+    const envelope = validateTaskEnvelope(body);
+    if (!envelope.ok) return { kind: "malformed", error: envelope.error };
+    if (envelope.value.hash !== task.hash) return { kind: "conflict", current: clone(task) };
 
-    const validated = validate(body);
+    const validated = validateTaskFields(body as Record<string, unknown>);
     if (!validated.ok) return { kind: "invalid", error: validated.error };
-    const { patch } = validated;
-    if (patch.assignee_id != null && !this.isProjectParticipant(task.project_id, patch.assignee_id)) {
+    const fields = validated.value;
+    const assigneeChanged = "assignee_id" in fields && fields.assignee_id !== task.assignee_id;
+    if (assigneeChanged && fields.assignee_id != null && !this.isProjectParticipant(task.project_id, fields.assignee_id)) {
       return { kind: "invalid", error: ASSIGNEE_RULE };
     }
 
     for (const field of MUTABLE_TASK_FIELDS) {
-      if (field in patch) (task as Record<MutableTaskField, unknown>)[field] = patch[field];
+      if (field in fields) (task as Record<MutableTaskField, unknown>)[field] = fields[field];
     }
     task.hash = bumpHash(task.hash);
     return { kind: "updated", task: clone(task) };

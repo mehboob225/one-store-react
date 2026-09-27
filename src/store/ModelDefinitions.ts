@@ -234,7 +234,6 @@ export function foreignKeyArrayNames(objectType: ObjectType): readonly string[] 
   return TYPE_FACTS[objectType].foreignKeyArrays;
 }
 
-
 // ---------------------------------------------------------------------------
 // Validation
 // ---------------------------------------------------------------------------
@@ -294,8 +293,6 @@ const RESERVED_CLASS_NAMES = new Set([
 /** The generator emits `<Model>AppData` base classes, so no model may take that suffix itself. */
 const GENERATED_SUFFIX = "AppData";
 
-
-
 /**
  * Valid identifier that the generator may emit as a data field, join key or
  * metaData key. Takes `unknown`: a missing value must fail, not be coerced
@@ -305,15 +302,15 @@ function isEmittable(name: unknown): name is string {
   return typeof name === "string" && IDENTIFIER.test(name) && !RESERVED.has(name);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 /**
  * A `__proto__` key in an object literal sets the prototype instead of adding
  * an entry, so the entry vanishes before validation can see it. Detect the
  * symptom: a schema record whose prototype is not the plain one.
  */
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 function isPlainRecord(record: object): boolean {
   const proto = Object.getPrototypeOf(record);
   return proto === Object.prototype || proto === null; // null-prototype maps are the safe way to avoid this
@@ -343,7 +340,6 @@ function checkEntry(ctx: TypeContext, label: string, entry: unknown): entry is R
   return false;
 }
 
-/** Own-property lookup: a field named "constructor" or "toString" must not resolve to Object.prototype. */
 /** Schema records are read with the same own-property rule as data fields (arrays are not records). */
 function own<T>(record: Record<string, T> | null | undefined, key: string): T | undefined {
   return Array.isArray(record) ? undefined : ownField(record, key);

@@ -6,7 +6,7 @@
  * fields are dropped; badly typed values are rejected before anything is
  * written or broadcast.
  */
-import type { NewTask, TaskPatch } from "./db";
+import type { NewTask, TaskFields } from "./db";
 import type { TaskRow } from "./fixtures";
 
 export type Validated<T> = { ok: true; value: T } | { ok: false; error: string };
@@ -59,13 +59,26 @@ export function validateNewTask(input: unknown): Validated<NewTask> {
   return problem ? fail(problem) : ok(value as unknown as NewTask);
 }
 
-/** `PUT /tasks/:id` body (`task`): hash required, mutable fields optional. */
-export function validateTaskPatch(input: unknown): Validated<TaskPatch> {
+/**
+ * `PUT /tasks/:id` body (`task`), step one — the envelope: an object carrying
+ * a string `hash`. Checked BEFORE the hash comparison, so a request without a
+ * hash is reported as malformed (400), never as a conflict.
+ */
+export function validateTaskEnvelope(input: unknown): Validated<{ hash: string }> {
   if (!isPlainObject(input)) return fail("task must be an object");
-  if (typeof input.hash !== "string") return fail("task.hash is required");
-  const value: Record<string, unknown> = { hash: input.hash };
+  if (typeof input.hash !== "string") return fail("task.hash must be a string");
+  return ok({ hash: input.hash });
+}
+
+/**
+ * `PUT /tasks/:id` body (`task`), step two — the mutable fields, all
+ * optional. Checked AFTER the hash comparison, so a stale hash wins over a
+ * bad value and the client always gets the current task on conflict.
+ */
+export function validateTaskFields(input: Record<string, unknown>): Validated<TaskFields> {
+  const value: Record<string, unknown> = {};
   const problem = collectTaskFields(input, value);
-  return problem ? fail(problem) : ok(value as unknown as TaskPatch);
+  return problem ? fail(problem) : ok(value as TaskFields);
 }
 
 /** `PUT /users/current/settings` body (`settings`): a plain object of preferences. */

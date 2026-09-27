@@ -11,7 +11,7 @@
  */
 import type { BunRequest } from "bun";
 import type { Database } from "./db";
-import { validateCredentials, validateNewTask, validateSettings, validateTaskPatch } from "./validation";
+import { validateCredentials, validateSettings } from "./validation";
 import { unauthorized, type Sessions } from "./auth";
 import type { PushHub } from "./push";
 
@@ -119,16 +119,20 @@ export function createRoutes(ctx: RouteContext) {
       }),
       POST: authed<"/api/v1/projects/:id/tasks">(async (req) => {
         const projectId = Number(req.params.id);
-        if (!db.getProject(projectId)) return notFound("project");
         const body = await json<{ task?: unknown }>(req);
-        const input = validateNewTask(body?.task);
-        if (!input.ok) return badRequest(input.error);
-        const outcome = db.createTask(projectId, input.value); // the assignee rule lives in the db
-        if (outcome.kind === "missing") return notFound("project");
-        if (outcome.kind === "invalid") return badRequest(outcome.error);
-        const task = db.withAssignee(outcome.task);
-        push.broadcast({ type: "new", objectType: "task", data: task });
-        return Response.json({ task }, { status: 201 });
+        // The db validates and applies the assignee rule itself: 404, then 400, then the write.
+        const outcome = db.createTask(projectId, body?.task);
+        switch (outcome.kind) {
+          case "missing":
+            return notFound("project");
+          case "invalid":
+            return badRequest(outcome.error);
+          case "created": {
+            const task = db.withAssignee(outcome.task);
+            push.broadcast({ type: "new", objectType: "task", data: task });
+            return Response.json({ task }, { status: 201 });
+          }
+        }
       }),
     },
 
@@ -140,11 +144,12 @@ export function createRoutes(ctx: RouteContext) {
     "/api/v1/projects/:id/tasks/import": {
       POST: authed<"/api/v1/projects/:id/tasks/import">((req) => {
         const projectId = Number(req.params.id);
-        if (!db.getProject(projectId)) return notFound("project");
+        if (!db.hasProject(projectId)) return notFound("project");
         const titles = ["Imported: triage backlog", "Imported: write docs", "Imported: plan release"];
-        for (const title of titles) db.createTask(projectId, { title });
+        // report what was actually written, not what was attempted
+        const imported = titles.filter((title) => db.createTask(projectId, { title }).kind === "created").length;
         push.broadcast({ type: "reload", objectType: "project", objectId: projectId });
-        return Response.json({ imported: titles.length });
+        return Response.json({ imported });
       }),
     },
 
@@ -160,15 +165,12 @@ export function createRoutes(ctx: RouteContext) {
         const body = await json<{ task?: unknown }>(req);
         // The db decides everything in one atomic step, in the documented order
         // (docs/API.md): 404, 400 malformed, 409 with the current task, 400 bad values.
-        const outcome = db.updateTask(id, body?.task, (task) => {
-          const patch = validateTaskPatch(task);
-          return patch.ok ? { ok: true, patch: patch.value } : patch;
-        });
+        const outcome = db.updateTask(id, body?.task);
         switch (outcome.kind) {
           case "missing":
             return notFound("task");
           case "malformed":
-            return badRequest("task must be an object with a string hash");
+            return badRequest(outcome.error);
           case "conflict":
             return Response.json({ error: "conflict", task: db.withAssignee(outcome.current) }, { status: 409 });
           case "invalid":
