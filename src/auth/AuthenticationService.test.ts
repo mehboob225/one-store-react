@@ -244,6 +244,32 @@ describe("return URL", () => {
 });
 
 describe("defaults", () => {
+  test("null options opt out: memory-only storage and no window listener", async () => {
+    const original = window.addEventListener;
+    let storageListeners = 0;
+    window.addEventListener = ((type: string, ...rest: unknown[]) => {
+      if (type === "storage") storageListeners++;
+      return (original as (...a: unknown[]) => void).call(window, type, ...rest);
+    }) as typeof window.addEventListener;
+    try {
+      window.localStorage.clear();
+      const auth = new AuthenticationServiceClass({ apiBase, localStorage: null, sessionStorage: null, eventTarget: null });
+      expect(storageListeners).toBe(0);
+
+      await auth.login("ada@example.com", "password");
+      expect(auth.isAuthenticated()).toBe(true);
+      expect(window.localStorage.getItem(CREDENTIALS_STORAGE_KEY)).toBeNull(); // never touched real storage
+      auth.saveReturnUrl("/x");
+      expect(auth.consumeReturnUrl()).toBeNull();
+
+      // and `undefined` (omitted) still means "use the window default"
+      new AuthenticationServiceClass({ apiBase });
+      expect(storageListeners).toBe(1);
+    } finally {
+      window.addEventListener = original;
+    }
+  });
+
   test("the default instance uses window storage and DomainConfiguration.api", async () => {
     const { AuthenticationService, CREDENTIALS_STORAGE_KEY: key } = await import("./AuthenticationService");
     window.localStorage.clear();
@@ -630,10 +656,14 @@ describe("finding 3 (round 2): a stale logout never wipes a newer session's shar
     const local = memoryStorage({ [`${STATE}a`]: "1", keep: "2" });
     const session = memoryStorage({ [`${STATE}b`]: "3" });
     const auth = service({ localStorage: local, sessionStorage: session });
-    auth.clearBrowserStorage({ tab: true });
+    auth.clearBrowserStorage("tab");
     expect(local.dump()).toEqual({ [`${STATE}a`]: "1", keep: "2" });
     expect(session.dump()).toEqual({});
-    auth.clearBrowserStorage();
+    session.setItem(`${STATE}c`, "4");
+    auth.clearBrowserStorage("shared");
     expect(local.dump()).toEqual({ keep: "2" });
+    expect(session.dump()).toEqual({ [`${STATE}c`]: "4" });
+    auth.clearBrowserStorage();
+    expect(session.dump()).toEqual({});
   });
 });

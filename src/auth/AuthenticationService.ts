@@ -82,6 +82,9 @@ export const PERSISTED_STATE_PREFIX = "_state_";
 
 type Listener = (credentials: Credentials | null) => void;
 
+/** Which persisted-state storage to clear: shared localStorage, this tab's sessionStorage, or both. */
+export type StorageScope = "all" | "shared" | "tab";
+
 /**
  * The one credential validator, shared by login responses, restored storage
  * and externally supplied credentials. Blank strings are not credentials.
@@ -106,12 +109,14 @@ export class AuthenticationServiceClass {
 
   constructor(options: AuthenticationServiceOptions = {}) {
     this.apiBase = options.apiBase ?? DomainConfiguration.api;
-    this.local = options.localStorage === undefined ? defaultStorage("localStorage") : options.localStorage;
-    this.session = options.sessionStorage === undefined ? defaultStorage("sessionStorage") : options.sessionStorage;
+    // `null` is a deliberate opt-out for these three (memory-only / no cross-tab
+    // listener), so only `undefined` may fall back to the default — not `??`.
+    this.local = orDefault(options.localStorage, () => defaultStorage("localStorage"));
+    this.session = orDefault(options.sessionStorage, () => defaultStorage("sessionStorage"));
     this.fetchImpl = options.fetch ?? ((input, init) => fetch(input, init));
     this.credentials = this.readStoredCredentials();
 
-    const target = options.eventTarget === undefined ? defaultWindow() : options.eventTarget;
+    const target = orDefault(options.eventTarget, defaultWindow);
     target?.addEventListener("storage", (event) => {
       const key = (event as StorageEvent).key;
       // key === null means the other tab called storage.clear()
@@ -219,9 +224,12 @@ export class AuthenticationServiceClass {
     this.commit(null, { persist: true, force: true });
   }
 
-  /** Removes every `_state_*` key from localStorage and sessionStorage (or just one of them). */
-  clearBrowserStorage(scope: { shared?: boolean; tab?: boolean } = { shared: true, tab: true }): void {
-    const targets = [scope.shared ? this.local : null, scope.tab ? this.session : null];
+  /**
+   * Removes every `_state_*` key from the given scope: shared localStorage,
+   * this tab's sessionStorage, or both (the default).
+   */
+  clearBrowserStorage(scope: StorageScope = "all"): void {
+    const targets = [scope !== "tab" ? this.local : null, scope !== "shared" ? this.session : null];
     for (const storage of targets) {
       if (!storage) continue;
       safe(() => {
@@ -268,29 +276,30 @@ export class AuthenticationServiceClass {
 
     this.generation++;
 
-    // Do we own the shared (localStorage) state? Only the tab performing the
-    // transition does — and not if storage already holds a different session,
-    // which means another tab performed a newer transition and owns it.
-    let ownsShared = persist;
-    if (persist) {
-      if (next) {
-        safe(() => this.local?.setItem(CREDENTIALS_STORAGE_KEY, JSON.stringify(next)));
-      } else {
-        const stored = this.readStoredCredentials(); // null when absent or corrupt
-        const foreign = stored !== null && stored.uuid !== prev?.uuid;
-        if (foreign) ownsShared = false;
-        else safe(() => this.local?.removeItem(CREDENTIALS_STORAGE_KEY)); // ours, or corrupt: remove
-      }
-    }
-
-    // Signed out (or explicitly logging out), or a different user signed in:
-    // persisted UI state must go — this tab's always, the shared one only if we own it.
-    const signedOut = next === null && (prev !== null || force);
-    const userChanged = prev !== null && next !== null && prev.userId !== next.userId;
-    if (signedOut || userChanged) this.clearBrowserStorage({ tab: true, shared: ownsShared });
+    const ownsShared = persist && this.persistCredentials(prev, next);
+    const scope = persistedStateScopeToClear({ prev, next, force, ownsShared });
+    if (scope) this.clearBrowserStorage(scope);
 
     this.credentials = next;
     if (!unchanged) for (const listener of this.listeners) listener(next);
+  }
+
+  /**
+   * Writes or removes the stored credentials. Returns whether this tab owns
+   * the shared (localStorage) state: it does when it performs the transition,
+   * unless storage already holds a *different* session — then another tab
+   * performed a newer transition and owns it, and nothing is removed.
+   */
+  private persistCredentials(prev: Credentials | null, next: Credentials | null): boolean {
+    if (next) {
+      safe(() => this.local?.setItem(CREDENTIALS_STORAGE_KEY, JSON.stringify(next)));
+      return true;
+    }
+    const stored = this.readStoredCredentials(); // null when absent or corrupt
+    const foreign = stored !== null && stored.uuid !== prev?.uuid;
+    if (foreign) return false;
+    safe(() => this.local?.removeItem(CREDENTIALS_STORAGE_KEY)); // ours, or corrupt: remove
+    return true;
   }
 
   private readStoredCredentials(): Credentials | null {
@@ -303,6 +312,23 @@ export class AuthenticationServiceClass {
   }
 }
 
+/**
+ * Which persisted UI state a transition must clear. Signing out (or an
+ * explicit logout) and switching to a different user both clear this tab's
+ * state; the shared state only if this tab owns it. Anything else: nothing.
+ */
+function persistedStateScopeToClear(t: {
+  prev: Credentials | null;
+  next: Credentials | null;
+  force: boolean;
+  ownsShared: boolean;
+}): StorageScope | null {
+  const signedOut = t.next === null && (t.prev !== null || t.force);
+  const userChanged = t.prev !== null && t.next !== null && t.prev.userId !== t.next.userId;
+  if (!signedOut && !userChanged) return null;
+  return t.ownsShared ? "all" : "tab";
+}
+
 function sameCredentials(a: Credentials | null, b: Credentials | null): boolean {
   if (a === null || b === null) return a === b;
   return a.uuid === b.uuid && a.token === b.token && a.userId === b.userId;
@@ -310,6 +336,16 @@ function sameCredentials(a: Credentials | null, b: Credentials | null): boolean 
 
 function isNonBlankString(value: unknown): value is string {
   return typeof value === "string" && value.trim() !== "";
+}
+
+/**
+ * Returns `value` unless it is `undefined`, in which case the fallback is
+ * computed. Unlike `??`, an explicit `null` is preserved: for the options
+ * that accept `null` it means "none", which must not become the default.
+ */
+function orDefault<T>(value: T | undefined, fallback: () => T): T {
+  if (value !== undefined) return value;
+  return fallback();
 }
 
 /** Runs `fn`, returning undefined if storage throws (private mode, quota, blocked). */
