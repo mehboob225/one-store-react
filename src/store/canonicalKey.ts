@@ -11,10 +11,12 @@
  *    so everything must key on `canonicalKey(value)` or they become two
  *    objects;
  *  - a data field is an OWN property. Inherited values and prototype
- *    accessors are not data (generated accessors live on the prototype), and
- *    an own property explicitly set to `undefined` counts as ABSENT, the same
- *    as a missing one (JSON cannot carry `undefined`; a partial update simply
- *    leaves the field out).
+ *    accessors are not data (generated accessors live on the prototype). A
+ *    field is PRESENT when it is an own property, whatever its value: the
+ *    cache replaces stored objects whole (data-flow §4.3 — the response is
+ *    authoritative), so an own `undefined` is not "leave it as it was", it
+ *    is "no value", exactly like `null`. Only a field that is not own at all
+ *    is absent, and absent fields are how `previous` is consulted.
  */
 export function isKeyValue(value: unknown): value is string | number {
   if (typeof value === "number") return Number.isFinite(value);
@@ -30,7 +32,7 @@ export function ownField<T>(record: Record<string, T> | null | undefined, field:
   return typeof record === "object" && record !== null && Object.hasOwn(record, field) ? record[field] : undefined;
 }
 
-/** Whether a data field is present per the own-property rule (own, and not `undefined`). */
+/** Whether a data field is present per the own-property rule (own, whatever its value). */
 export function hasField(record: Record<string, unknown> | null | undefined, field: string): boolean {
-  return ownField(record, field) !== undefined;
+  return typeof record === "object" && record !== null && Object.hasOwn(record, field);
 }

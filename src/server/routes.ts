@@ -113,7 +113,7 @@ export function createRoutes(ctx: RouteContext) {
     "/api/v1/projects/:id/tasks": {
       GET: authed<"/api/v1/projects/:id/tasks">((req) => {
         const projectId = Number(req.params.id);
-        if (!db.getProject(projectId)) return notFound("project");
+        if (!db.hasProject(projectId)) return notFound("project");
         const tasks = db.listTasks(projectId).map((t) => db.withAssignee(t));
         return Response.json({ tasks });
       }),
@@ -148,7 +148,7 @@ export function createRoutes(ctx: RouteContext) {
         const titles = ["Imported: triage backlog", "Imported: write docs", "Imported: plan release"];
         // report what was actually written, not what was attempted
         const imported = titles.filter((title) => db.createTask(projectId, { title }).kind === "created").length;
-        push.broadcast({ type: "reload", objectType: "project", objectId: projectId });
+        if (imported > 0) push.broadcast({ type: "reload", objectType: "project", objectId: projectId });
         return Response.json({ imported });
       }),
     },
@@ -169,8 +169,6 @@ export function createRoutes(ctx: RouteContext) {
         switch (outcome.kind) {
           case "missing":
             return notFound("task");
-          case "malformed":
-            return badRequest(outcome.error);
           case "conflict":
             return Response.json({ error: "conflict", task: db.withAssignee(outcome.current) }, { status: 409 });
           case "invalid":
@@ -197,7 +195,7 @@ export function createRoutes(ctx: RouteContext) {
     "/api/v1/tasks/:id/comments": {
       GET: authed<"/api/v1/tasks/:id/comments">((req) => {
         const id = Number(req.params.id);
-        if (!db.getTask(id)) return notFound("task");
+        if (!db.hasTask(id)) return notFound("task");
         return Response.json({ comments: db.listComments(id) });
       }),
     },
@@ -206,7 +204,7 @@ export function createRoutes(ctx: RouteContext) {
     "/api/v1/tasks/:id/tags": {
       GET: authed<"/api/v1/tasks/:id/tags">((req) => {
         const id = Number(req.params.id);
-        if (!db.getTask(id)) return notFound("task");
+        if (!db.hasTask(id)) return notFound("task");
         return Response.json({ tags: db.listTagsForTask(id) });
       }),
     },

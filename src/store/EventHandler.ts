@@ -163,8 +163,9 @@ export type BroadcastInput =
    * `previous` is the pre-write state of `objects`, matched by index value
    * (unmatched entries are ignored). For each declared foreign key present in
    * the written object whose value changed, the old bucket is notified too.
-   * A foreign key absent from the written object (partial update) is
-   * unchanged and its bucket is taken from `previous`.
+   * A foreign key that is not an own property of the written object (a
+   * partial write) is unchanged and its bucket is taken from `previous`; an
+   * own `undefined` or `null` means the object has no value there.
    */
   | (BroadcastBase & { action: "update"; objects: readonly Row[]; previous: readonly Row[] })
   /** `objects` must be the STORED objects (with their foreign keys), never id-only stubs. */
@@ -366,12 +367,12 @@ export class DataEventHandler {
   }
 
   /**
-   * Notifies the bucket the object is in now (or, for a partial update
-   * missing the field, the bucket `previous` says it is in) and — when the
-   * value changed — the bucket it left.
+   * Notifies the bucket the object is in now (or, when the field is not an
+   * own property of the write, the bucket `previous` says it is in) and —
+   * when the value changed — the bucket it left.
    */
   private enqueueForeignKey(values: Map<string, Target>, objectType: string, fk: string, id: IndexValue, object: Row, before: Row | undefined): void {
-    const present = hasField(object, fk); // own and not undefined — the same meaning of "present" as the write guard
+    const present = hasField(object, fk); // own property, whatever its value — the same meaning as the write guard
     const current = present ? object[fk] : ownField(before, fk);
     this.enqueueForeignValue(values, objectType, fk, current, id);
 

@@ -623,8 +623,9 @@ describe("validateModelDefinitions", () => {
     }
   });
 
-  test("an own foreign key set to undefined is absent, like a missing one (review 10, finding 4)", () => {
+  test("an own foreign key set to undefined means 'no value', like null: the guard accepts both (review 10 finding 4, review 12 finding 2)", () => {
     expect(invalidForeignKeyFields("tasks", { id: 1, project_id: undefined })).toEqual([]);
+    expect(invalidForeignKeyFields("tasks", { id: 1, project_id: null })).toEqual([]);
     expect(invalidForeignKeyFields("tasks", { id: 1 })).toEqual([]);
   });
 

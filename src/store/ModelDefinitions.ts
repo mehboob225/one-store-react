@@ -517,6 +517,7 @@ function checkRelatedObjectTypes(ctx: TypeContext): void {
     const child = referenced(ctx, rel.objectType);
     if (!child || !keyOk) continue; // the child (or the key) was already reported
     const childFk = isRecord(child.foreignKeys) ? own(child.foreignKeys, rel.key) : undefined;
+    if (childFk !== undefined && !isRecord(childFk)) continue; // a mistyped entry is reported by the child's own check
     if (!childFk) {
       problem(ctx, `${label}.key "${rel.key}" is not declared in ${rel.objectType}.foreignKeys (grouped index + events need it)`);
     } else if (childFk.objectType !== ctx.type) {
@@ -691,7 +692,7 @@ const NO_BAD_FIELDS: readonly string[] = Object.freeze([]);
  * cache calls this on write so a boolean, NaN or nested object in one of
  * those fields fails loudly instead of silently never notifying anyone.
  * The index is required and may not be null; foreign keys may be absent
- * (partial update) or null. Pass a definitions map to check against a
+ * (not an own property) or null/undefined. Pass a definitions map to check against a
  * schema other than the built-in one.
  */
 export function invalidForeignKeyFields(objectType: ObjectType, record: Record<string, unknown>): readonly string[];
@@ -702,7 +703,7 @@ export function invalidForeignKeyFields(objectType: string, record: Record<strin
   // no closure and no array on the clean path: `bad` is created by the first problem
   let bad: string[] | undefined;
   if (!isKeyValue(ownField(record, facts.index))) bad = [facts.index];
-  // `hasField`: an own field set to undefined is absent (partial update), like the event bus
+  // `hasField`: own property only (see canonicalKey.ts); undefined and null are both "no value"
   for (const field of facts.foreignKeys) {
     if (hasField(record, field) && !isForeignKeyValue(record[field])) bad = addUnique(bad, field);
   }

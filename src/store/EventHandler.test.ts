@@ -285,19 +285,30 @@ describe("DataEventHandler", () => {
       expect(ids).toEqual([8, 9]); // an accessor defined on the object itself is an own property; an inherited id is not
     });
 
-    test("an own foreign key set to undefined is absent, like the write guard says: the object stays in its bucket (review 10, finding 4)", async () => {
+    test("an own foreign key set to undefined means 'no value', like null: the object has LEFT its bucket (review 12, finding 2)", async () => {
+      // The cache replaces stored objects whole, so a written `undefined` is the new value.
+      for (const noValue of [undefined, null]) {
+        const bus = new DataEventHandler();
+        const keys: string[] = [];
+        bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => keys.push(`${b.key}:${b.ids.join(",")}`));
+        bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 43 }, (b) => keys.push(b.key));
+        bus.broadcast({
+          objectType: "tasks",
+          action: "update",
+          objects: [{ id: 7, project_id: noValue, title: "x" }],
+          previous: [{ id: 7, project_id: 42 }],
+          foreignKeys: ["project_id"],
+        });
+        await tick();
+        expect(keys).toEqual(["tasks/project_id/42:7"]); // the old bucket hears it left; no bucket gains it
+      }
+      // whereas a field that is not own at all is absent: the object stays where `previous` says
       const bus = new DataEventHandler();
       const keys: string[] = [];
       bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => keys.push(`${b.key}:${b.ids.join(",")}`));
-      bus.broadcast({
-        objectType: "tasks",
-        action: "update",
-        objects: [{ id: 7, project_id: undefined, title: "x" }],
-        previous: [{ id: 7, project_id: 42 }],
-        foreignKeys: ["project_id"],
-      });
+      bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7, title: "x" }], previous: [{ id: 7, project_id: 42 }], foreignKeys: ["project_id"] });
       await tick();
-      expect(keys).toEqual(["tasks/project_id/42:7"]); // one notification, from the bucket it is still in
+      expect(keys).toEqual(["tasks/project_id/42:7"]);
     });
 
     test("`previous` entries whose id is not in `objects` are ignored", async () => {

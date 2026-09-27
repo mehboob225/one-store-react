@@ -303,7 +303,7 @@ describe("projects and tasks", () => {
     expect(mock.db.createTask(1, { title: "" })).toEqual({ kind: "invalid", error: "task.title must be a non-empty string" });
     expect(mock.db.createTask(999, { title: "x" }).kind).toBe("missing");
     expect(mock.db.updateTask(1, { hash: "t1-1", status: "bogus" })).toMatchObject({ kind: "invalid" });
-    expect(mock.db.updateTask(1, "nope")).toEqual({ kind: "malformed", error: "task must be an object" });
+    expect(mock.db.updateTask(1, "nope")).toEqual({ kind: "invalid", error: "task must be an object" });
     expect(mock.db.isProjectParticipant(1, 3)).toBe(false);
     expect(mock.db.isProjectParticipant(2, 1)).toBe(true);
   });
@@ -326,10 +326,32 @@ describe("projects and tasks", () => {
     expect((await put({ hash, assignee_id: 1, status: "done" })).status).toBe(200);
   });
 
-  test("the import route reports what was written (review 11, finding 2)", async () => {
-    const body = (await (await api("/projects/2/tasks/import", { method: "POST" })).json()) as { imported: number };
-    const tasks = ((await (await api("/projects/2/tasks")).json()) as { tasks: { title: string }[] }).tasks;
-    expect(body.imported).toBe(tasks.filter((t) => t.title.startsWith("Imported:")).length);
+  test("the import route reports what was written and broadcasts only then (review 11 finding 2, review 12 findings 3, 7)", async () => {
+    const broadcasts: unknown[] = [];
+    const originalBroadcast = mock.push.broadcast.bind(mock.push);
+    const originalCreate = mock.db.createTask.bind(mock.db);
+    mock.push.broadcast = (message) => {
+      broadcasts.push(message);
+      originalBroadcast(message);
+    };
+    try {
+      // one of the three creates fails: the count must say 2, not 3
+      let calls = 0;
+      mock.db.createTask = (projectId, body) => (++calls === 2 ? { kind: "invalid", error: "stubbed" } : originalCreate(projectId, body));
+      let body = (await (await api("/projects/2/tasks/import", { method: "POST" })).json()) as { imported: number };
+      expect(body.imported).toBe(2);
+      expect(broadcasts).toEqual([{ type: "reload", objectType: "project", objectId: 2 }]);
+
+      // every create fails: nothing written, nothing broadcast
+      broadcasts.length = 0;
+      mock.db.createTask = () => ({ kind: "invalid", error: "stubbed" });
+      body = (await (await api("/projects/2/tasks/import", { method: "POST" })).json()) as { imported: number };
+      expect(body.imported).toBe(0);
+      expect(broadcasts).toEqual([]);
+    } finally {
+      mock.db.createTask = originalCreate;
+      mock.push.broadcast = originalBroadcast;
+    }
     expect((await api("/projects/999/tasks/import", { method: "POST" })).status).toBe(404);
   });
 

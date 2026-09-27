@@ -37,11 +37,12 @@ export type CreateOutcome = { kind: "missing" } | { kind: "invalid"; error: stri
 
 /**
  * Outcome of `updateTask`, in check order — the route maps each to a status:
- * missing → 404, malformed → 400, conflict → 409, invalid → 400.
+ * missing → 404, conflict → 409, invalid → 400 (a malformed envelope and a
+ * bad field value are both `invalid`; the docblock on `updateTask` gives the
+ * order in which they are detected).
  */
 export type UpdateOutcome =
   | { kind: "missing" }
-  | { kind: "malformed"; error: string }
   | { kind: "conflict"; current: TaskRow }
   | { kind: "invalid"; error: string }
   | { kind: "updated"; task: TaskRow };
@@ -146,6 +147,10 @@ export class Database {
     return this.data.projects.some((p) => p.id === id);
   }
 
+  hasTask(id: number): boolean {
+    return this.data.tasks.some((t) => t.id === id);
+  }
+
   /**
    * Creates a task from an untrusted body, in one step: the project must
    * exist, the body must validate, and an assignee must be an owner or
@@ -153,11 +158,13 @@ export class Database {
    * so every writer (routes, imports, tests) gets them.
    */
   createTask(projectId: number, body: unknown): CreateOutcome {
-    if (!this.hasProject(projectId)) return { kind: "missing" };
+    const project = this.data.projects.find((p) => p.id === projectId); // one lookup serves both checks
+    if (!project) return { kind: "missing" };
     const validated = validateNewTask(body);
     if (!validated.ok) return { kind: "invalid", error: validated.error };
     const input: NewTask = validated.value;
-    if (input.assignee_id != null && !this.isProjectParticipant(projectId, input.assignee_id)) {
+    const assignee = input.assignee_id;
+    if (assignee != null && project.owner_id !== assignee && !project.member_ids.includes(assignee)) {
       return { kind: "invalid", error: ASSIGNEE_RULE };
     }
     const id = this.nextId.tasks++;
@@ -178,7 +185,7 @@ export class Database {
    * Updates a task from an untrusted body in ONE synchronous step — optimistic
    * locking depends on nothing happening between the hash check and the write:
    *   1. the task must exist                                       → missing
-   *   2. the envelope: an object with a string `hash`             → malformed
+   *   2. the envelope: an object with a string `hash`             → invalid (400, before the hash is compared)
    *   3. the hash must be the current one                          → conflict (with the current row)
    *   4. the field values must validate, and a CHANGED assignee
    *      must be an owner or member                                → invalid
@@ -191,7 +198,7 @@ export class Database {
     const task = this.data.tasks.find((t) => t.id === id);
     if (!task) return { kind: "missing" };
     const envelope = validateTaskEnvelope(body);
-    if (!envelope.ok) return { kind: "malformed", error: envelope.error };
+    if (!envelope.ok) return { kind: "invalid", error: envelope.error };
     if (envelope.value.hash !== task.hash) return { kind: "conflict", current: clone(task) };
 
     const validated = validateTaskFields(body as Record<string, unknown>);
