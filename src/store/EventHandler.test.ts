@@ -1,5 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
-import { DataEventHandler, EventHandler, eventKey, keySegment, type DataEventBatch } from "./EventHandler";
+import { DataEventHandler, EventHandler, eventKey, fkKey, idKey, keySegment, type DataEventBatch } from "./EventHandler";
 
 const tick = () => new Promise<void>((r) => queueMicrotask(r));
 
@@ -136,27 +136,40 @@ describe("DataEventHandler", () => {
     expect(batch.actions).toEqual(["add"]);
   });
 
-  test("several writes before the flush merge into one batch per key carrying the LAST action per id (review findings 3, 4)", async () => {
+  test("several writes before the flush merge into one batch per key with NET actions per id (review 2, finding 3)", async () => {
     const bus = new DataEventHandler();
     const batches: DataEventBatch[] = [];
     bus.subscribe({ objectType: "tasks" }, (b) => batches.push(b));
     bus.subscribe({ objectType: "tasks", id: 1 }, (b) => batches.push(b));
 
     bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 1 }, { id: 2 }] });
-    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] });
-    bus.broadcast({ objectType: "tasks", action: "remove", objects: [{ id: 2 }] });
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] }); // add+update → still new
+    bus.broadcast({ objectType: "tasks", action: "remove", objects: [{ id: 2 }] }); // add+remove → cancels out
     await tick();
 
     expect(batches).toHaveLength(2);
-    // a bucket listener can tell which id was removed and which was added/updated
-    expect(batches[0]).toEqual({
-      key: "tasks",
-      objectType: "tasks",
-      changes: [{ id: 1, action: "update" }, { id: 2, action: "remove" }],
-      ids: [1, 2],
-      actions: ["update", "remove"],
-    });
-    expect(batches[1]).toEqual({ key: "tasks/1", objectType: "tasks", changes: [{ id: 1, action: "update" }], ids: [1], actions: ["update"] });
+    expect(batches[0]).toEqual({ key: "tasks", objectType: "tasks", changes: [{ id: 1, action: "add" }], ids: [1], actions: ["add"] });
+    expect(batches[1]).toEqual({ key: "tasks/1", objectType: "tasks", changes: [{ id: 1, action: "add" }], ids: [1], actions: ["add"] });
+  });
+
+  test("a batch whose ids all cancelled out is not delivered", async () => {
+    const bus = new DataEventHandler();
+    const seen = mock(() => {});
+    bus.subscribe({ objectType: "tasks" }, seen);
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 9 }] });
+    bus.broadcast({ objectType: "tasks", action: "remove", objects: [{ id: 9 }] });
+    await tick();
+    expect(seen).not.toHaveBeenCalled();
+  });
+
+  test("the optimistic-create case: add then update in one tick still reports `add`", async () => {
+    const bus = new DataEventHandler();
+    const batches: DataEventBatch[] = [];
+    bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 1 }, (b) => batches.push(b));
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 9, project_id: 1 }], foreignKeys: ["project_id"] });
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 9, project_id: 1 }], foreignKeys: ["project_id"] });
+    await tick();
+    expect(batches[0]!.changes).toEqual([{ id: 9, action: "add" }]);
   });
 
   test("remove → add → remove within one tick reports the final state: removed (review finding 3)", async () => {
@@ -338,18 +351,18 @@ describe("DataEventHandler", () => {
     expect(late).not.toHaveBeenCalled();
   });
 
-  test("PR #5 review: reassigning a foreign key notifies the OLD bucket too when `previous` is passed", async () => {
+  test("reassigning a foreign key: the old bucket hears `remove`, the new bucket hears `add` (review 2, finding 4)", async () => {
     const bus = new DataEventHandler();
     const batches: DataEventBatch[] = [];
     bus.subscribe({ objectType: "tasks", keyName: "assignee_id", key: 1 }, (b) => batches.push(b));
     bus.subscribe({ objectType: "tasks", keyName: "assignee_id", key: 2 }, (b) => batches.push(b));
 
-    // without previous: only the new bucket hears (the gap the review found)
+    // without previous: only the new bucket hears, with the write's own action (the gap the first review found)
     bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7, assignee_id: 2 }], foreignKeys: ["assignee_id"] });
     await tick();
-    expect(batches.map((b) => b.key)).toEqual(["tasks/assignee_id/2"]);
+    expect(batches.map((b) => [b.key, b.changes])).toEqual([["tasks/assignee_id/2", [{ id: 7, action: "update" }]]]);
 
-    // with previous: both buckets hear, each with the object's id and the update action
+    // with previous: bucket-relative actions
     batches.length = 0;
     bus.broadcast({
       objectType: "tasks",
@@ -359,8 +372,26 @@ describe("DataEventHandler", () => {
       foreignKeys: ["assignee_id"],
     });
     await tick();
-    expect(batches.map((b) => b.key).sort()).toEqual(["tasks/assignee_id/1", "tasks/assignee_id/2"]);
-    for (const b of batches) expect(b).toMatchObject({ objectType: "tasks", actions: ["update"], ids: [7] });
+    const byKey = Object.fromEntries(batches.map((b) => [b.key, b.changes]));
+    expect(byKey).toEqual({
+      "tasks/assignee_id/2": [{ id: 7, action: "add" }],
+      "tasks/assignee_id/1": [{ id: 7, action: "remove" }],
+    });
+  });
+
+  test("foreign key set from null, and cleared to null, are `add` and `remove` for the one bucket involved", async () => {
+    const bus = new DataEventHandler();
+    const batches: DataEventBatch[] = [];
+    bus.subscribe({ objectType: "tasks", keyName: "assignee_id", key: 1 }, (b) => batches.push(b));
+
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7, assignee_id: 1 }], previous: [{ id: 7, assignee_id: null }], foreignKeys: ["assignee_id"] });
+    await tick();
+    expect(batches.map((b) => b.changes)).toEqual([[{ id: 7, action: "add" }]]);
+
+    batches.length = 0;
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7, assignee_id: null }], previous: [{ id: 7, assignee_id: 1 }], foreignKeys: ["assignee_id"] });
+    await tick();
+    expect(batches.map((b) => b.changes)).toEqual([[{ id: 7, action: "remove" }]]);
   });
 
   test("PR #5 review: a remove broadcast with the stored object notifies the foreign-key bucket", async () => {
@@ -382,12 +413,12 @@ describe("DataEventHandler", () => {
     expect(keys).toEqual(["tasks", "tasks/7", "tasks/project_id/42"]);
   });
 
-  test("`previous` only adds foreign-key keys; an unchanged FK is deduplicated, and previous alone never adds type/id keys", async () => {
+  test("`previous` is matched by id: an unchanged FK yields one delivery with the write's action; unmatched entries are ignored (review 2, finding 7)", async () => {
     const bus = new DataEventHandler();
     const keys: string[] = [];
     bus.subscribeKey("tasks", (b) => keys.push(b.key));
     bus.subscribeKey("tasks/7", (b) => keys.push(b.key));
-    bus.subscribeKey("tasks/project_id/1", (b) => keys.push(`${b.key}:${b.ids.join(",")}`));
+    bus.subscribeKey("tasks/project_id/1", (b) => keys.push(`${b.key}:${b.changes.map((c) => `${c.id}=${c.action}`).join(",")}`));
 
     bus.broadcast({
       objectType: "tasks",
@@ -397,12 +428,19 @@ describe("DataEventHandler", () => {
       foreignKeys: ["project_id"],
     });
     await tick();
-    expect(keys).toEqual(["tasks", "tasks/7", "tasks/project_id/1:7"]); // one delivery, not two
+    expect(keys).toEqual(["tasks", "tasks/7", "tasks/project_id/1:7=update"]);
 
+    // a whole-bucket snapshot as previous: ids not in `objects` produce nothing
     keys.length = 0;
-    bus.broadcast({ objectType: "tasks", action: "update", objects: [], previous: [{ id: 9, project_id: 1 }], foreignKeys: ["project_id"] });
+    bus.broadcast({
+      objectType: "tasks",
+      action: "update",
+      objects: [{ id: 7, project_id: 1 }],
+      previous: [{ id: 7, project_id: 1 }, { id: 8, project_id: 1 }, { id: 9, project_id: 1 }],
+      foreignKeys: ["project_id"],
+    });
     await tick();
-    expect(keys).toEqual(["tasks/project_id/1:9"]); // old bucket only; no "tasks" or "tasks/9"
+    expect(keys).toEqual(["tasks", "tasks/7", "tasks/project_id/1:7=update"]);
   });
 
   test("a throwing onListenerError handler does not escape delivery", () => {
@@ -436,5 +474,124 @@ describe("DataEventHandler", () => {
     bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 1 }] });
     await tick();
     expect(bus.pendingKeys).toEqual([]);
+  });
+
+  test("a subscriber never receives changes queued before it subscribed, even when another listener already queued the key (review 2, finding 1)", async () => {
+    const bus = new DataEventHandler();
+    const early = mock(() => {});
+    const late = mock(() => {});
+    bus.subscribe({ objectType: "tasks", id: 1 }, early); // makes "tasks/1" a queued key
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] });
+    bus.subscribe({ objectType: "tasks", id: 1 }, late); // same tick, after the change
+    await tick();
+    expect(early).toHaveBeenCalledTimes(1);
+    expect(late).not.toHaveBeenCalled();
+
+    // but a change broadcast after it subscribed, merged into the same batch, does reach it
+    const later = mock(() => {});
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] });
+    bus.subscribe({ objectType: "tasks", id: 1 }, later);
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] });
+    await tick();
+    expect(later).toHaveBeenCalledTimes(1);
+  });
+
+  test("StrictMode-style unsubscribe/resubscribe between a broadcast and its flush does not replay the change", async () => {
+    const bus = new DataEventHandler();
+    const other = mock(() => {});
+    const seen = mock(() => {});
+    bus.subscribe({ objectType: "tasks" }, other);
+    const off = bus.subscribe({ objectType: "tasks" }, seen);
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] });
+    off();
+    bus.subscribe({ objectType: "tasks" }, seen); // remount
+    await tick();
+    expect(other).toHaveBeenCalledTimes(1);
+    expect(seen).not.toHaveBeenCalled();
+  });
+
+  test("a listener subscribed during a flush to a LATER key in that flush is not called (review 2, finding 2)", async () => {
+    const bus = new DataEventHandler();
+    const child = mock(() => {});
+    bus.subscribe({ objectType: "tasks", id: 7 }, () => {}); // "tasks/7" is already a queued key
+    bus.subscribe({ objectType: "tasks" }, () => {
+      bus.subscribe({ objectType: "tasks", id: 7 }, child); // parent listener mounts a child
+    });
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7 }] });
+    await tick();
+    expect(child).not.toHaveBeenCalled();
+
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7 }] });
+    await tick();
+    expect(child).toHaveBeenCalledTimes(1);
+  });
+
+  test("numeric and string forms of an id are one change entry (review 2, finding 5)", async () => {
+    const bus = new DataEventHandler();
+    const batches: DataEventBatch[] = [];
+    bus.subscribe({ objectType: "tasks", id: 7 }, (b) => batches.push(b));
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 7 }] });
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: "7" }] }); // e.g. a push payload
+    await tick();
+    expect(batches).toHaveLength(1);
+    expect(batches[0]!.changes).toEqual([{ id: 7, action: "add" }]); // first-seen form, net action
+  });
+
+  test("objectType and keyName segments are escaped too, so no shape can collide (review 2, finding 6)", async () => {
+    expect(idKey("tasks/project_id", 42)).toBe("tasks%2Fproject_id/42");
+    expect(fkKey("tasks", "project_id", 42)).toBe("tasks/project_id/42");
+    expect(idKey("tasks/project_id", 42)).not.toBe(fkKey("tasks", "project_id", 42));
+    expect(fkKey("tasks", "a/b", 1)).toBe("tasks/a%2Fb/1");
+
+    const bus = new DataEventHandler();
+    const wrong = mock(() => {});
+    const right = mock(() => {});
+    bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, wrong);
+    bus.subscribe({ objectType: "tasks/project_id", id: 42 }, right);
+    bus.broadcast({ objectType: "tasks/project_id", action: "update", objects: [{ id: 42 }] });
+    await tick();
+    expect(wrong).not.toHaveBeenCalled();
+    expect(right).toHaveBeenCalledTimes(1);
+  });
+
+  test("subscribe and broadcast build keys through the same helpers (review 2, finding 8)", async () => {
+    const bus = new DataEventHandler();
+    const seen: string[] = [];
+    bus.subscribe({ objectType: "odd/type", id: "a/b" }, (b) => seen.push(b.key));
+    bus.subscribe({ objectType: "odd/type", keyName: "x/y", key: "1/2" }, (b) => seen.push(b.key));
+    bus.broadcast({ objectType: "odd/type", action: "add", objects: [{ id: "a/b", "x/y": "1/2" }], foreignKeys: ["x/y"] });
+    await tick();
+    expect(seen).toEqual([idKey("odd/type", "a/b"), fkKey("odd/type", "x/y", "1/2")]);
+  });
+
+  test("per-id and per-FK keys are not even built when no listener of that shape exists for the type (review 2, finding 9)", async () => {
+    const bus = new DataEventHandler();
+    let fkReads = 0;
+    const object = new Proxy({ id: 1, project_id: 1 } as Record<string, unknown>, {
+      get(target, prop, receiver) {
+        if (prop === "project_id") fkReads++;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+
+    // no listeners at all: nothing is read
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [object], foreignKeys: ["project_id"] });
+    expect(fkReads).toBe(0);
+
+    // a bucket listener only: the FK field is still never read
+    bus.subscribe({ objectType: "tasks" }, () => {});
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [object], foreignKeys: ["project_id"] });
+    expect(fkReads).toBe(0);
+
+    // an FK listener on another value of the same type: the field must be read to know
+    const off = bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 999 }, () => {});
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [object], foreignKeys: ["project_id"] });
+    expect(fkReads).toBe(1);
+
+    // and after it unsubscribes the count drops back to zero
+    off();
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [object], foreignKeys: ["project_id"] });
+    expect(fkReads).toBe(1);
+    await tick();
   });
 });
