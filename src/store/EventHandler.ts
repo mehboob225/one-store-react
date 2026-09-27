@@ -28,19 +28,24 @@
  *
  *    Keys are collected in a pending map and flushed in a microtask, so a
  *    500-object write produces ONE callback per subscription. Only keys that
- *    have listeners are queued, and per-id / per-foreign-key keys are not
- *    even built when no listener of that shape exists for the type. Nothing
- *    here consults the schema: the cache (step 7) passes the index field and
- *    foreign-key names from ModelDefinitions.
+ *    have listeners are queued, and a per-id or per-foreign-key key is only
+ *    built for ids and values somebody is watching. Nothing here consults
+ *    the schema: the cache (step 7) passes the index field and foreign-key
+ *    names from ModelDefinitions.
  *
  * Delivery contract (both classes):
  *  - each `subscribe` call is its own subscription, even for the same function;
  *  - a listener unsubscribed during a delivery is not called in that delivery
  *    (an unmount cleanup must silence its listener immediately);
- *  - a listener is only ever called for a batch that contains at least one
- *    change broadcast after it subscribed — never for changes queued before
- *    it existed, including by other listeners on the same key, and never in
- *    the flush during which it subscribed;
+ *  - a listener subscribed during a delivery is not called by that delivery
+ *    pass, but may be called by a later batch of the same flush;
+ *  - pending batches go to whoever listens when they are flushed. A batch may
+ *    therefore include changes made just before a listener subscribed. That
+ *    is deliberate: a redundant invalidation costs one re-read, a missed one
+ *    costs a stale screen. It also means the bus cannot cover the gap between
+ *    a component reading the store and subscribing to it — SUBSCRIBERS MUST
+ *    RE-READ THE STORE ONCE AFTER SUBSCRIBING (the timestamp atoms do this on
+ *    mount);
  *  - a throwing listener never stops the others;
  *  - a `flush()` requested from inside a flush runs after the current one,
  *    so batches are always delivered in the order they were queued.
@@ -73,26 +78,17 @@ function report(handler: ListenerErrorHandler, error: unknown, context: { key?: 
 /** One subscription. Two subscriptions of the same function are two entries. */
 interface Entry<P> {
   readonly listener: (payload: P) => void;
-  /** The bus sequence number when subscribed; batches not newer than this are skipped. */
-  readonly since: number;
 }
 
 /**
  * Calls each entry's listener with `payload`. Iterates a snapshot for
- * stability, skips entries removed from `live` during the delivery, and —
- * when `newestChange` is given — skips entries subscribed at or after it.
+ * stability (entries added meanwhile wait for the next delivery) and skips
+ * entries removed from `live` during the delivery.
  */
-function deliver<P>(
-  live: ReadonlySet<Entry<P>>,
-  payload: P,
-  onError: ListenerErrorHandler,
-  context: { key?: string },
-  newestChange?: number,
-): void {
+function deliver<P>(live: ReadonlySet<Entry<P>>, payload: P, onError: ListenerErrorHandler, context: { key?: string }): void {
   const snapshot = Array.from(live);
   for (const entry of snapshot) {
     if (!live.has(entry)) continue; // unsubscribed during this delivery
-    if (newestChange !== undefined && entry.since >= newestChange) continue; // subscribed after every change in the batch
     try {
       entry.listener(payload);
     } catch (error) {
@@ -108,7 +104,7 @@ export class EventHandler<T> {
 
   /** Adds a listener. Returns the function that removes exactly this subscription. */
   subscribe(listener: (payload: T) => void): Unsubscribe {
-    const entry: Entry<T> = { listener, since: 0 };
+    const entry: Entry<T> = { listener };
     this.entries.add(entry);
     return () => {
       this.entries.delete(entry);
@@ -150,9 +146,10 @@ export interface DataChange {
 /**
  * One flushed batch for one key. An invalidation signal: re-read the store,
  * do not apply it to a local copy. Actions are net effects (add then update
- * is `add`; add then remove is dropped; remove then add is `update`) and,
- * for a foreign-key key, relative to that bucket (an object reassigned into
- * it is `add`, one reassigned out of it is `remove`).
+ * is `add`; add then remove is dropped; remove then add is `update`; remove
+ * then update stays `remove`) and, for a foreign-key key, relative to that
+ * bucket (an object reassigned into it is `add`, one reassigned out of it or
+ * deleted is `remove`).
  */
 export interface DataEventBatch {
   key: string;
@@ -179,8 +176,10 @@ export interface BroadcastInput {
   /**
    * The pre-write state of the objects in `objects`, matched by index value;
    * entries whose id is not in `objects` are ignored. For each declared
-   * foreign key whose value changed, the old bucket's key is emitted with
-   * `remove` and the new bucket's with `add`.
+   * foreign key *present* in the written object whose value changed, the old
+   * bucket's key is emitted with `remove` and the new bucket's with `add`. A
+   * foreign key absent from the written object (partial update) is unchanged
+   * and its bucket is taken from `previous`.
    */
   previous?: readonly Record<string, unknown>[];
   /** Identity field, from ModelDefinitions[objectType].index. Default "id". */
@@ -196,6 +195,10 @@ export function keySegment(value: IndexValue): string {
   return String(value).replace(/%/g, "%25").replace(/\//g, "%2F");
 }
 
+function unescapeSegment(segment: string): string {
+  return segment.replace(/%2F/g, "/").replace(/%25/g, "%");
+}
+
 export function bucketKey(objectType: string): string {
   return keySegment(objectType);
 }
@@ -209,34 +212,44 @@ export function fkKey(objectType: string, keyName: string, value: IndexValue): s
 }
 
 /**
- * Builds the string key for a selector. Throws when `id` or `key` is
- * present but undefined: that selector would type-check (it matches the
- * bare bucket shape) and then never fire. Subscribe conditionally instead.
+ * Builds the string key for a selector. Defined values decide the shape, so
+ * an id selector that also carries `keyName: undefined` is still an id
+ * selector. A selector whose only discriminator is present but undefined
+ * throws: it would type-check (it matches the bare bucket shape) and then
+ * never fire. Subscribe conditionally instead.
  */
 export function eventKey(selector: DataEventSelector): string {
-  if ("keyName" in selector || "key" in selector) {
-    const { keyName, key } = selector as { keyName?: string; key?: IndexValue };
+  const { objectType, id, keyName, key } = selector as {
+    objectType: string;
+    id?: IndexValue;
+    keyName?: string;
+    key?: IndexValue;
+  };
+  if (keyName !== undefined || key !== undefined) {
     if (typeof keyName !== "string" || !isIndexValue(key)) {
-      throw new TypeError(`eventKey: selector for "${selector.objectType}" has an undefined keyName or key`);
+      throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key`);
     }
-    return fkKey(selector.objectType, keyName, key);
+    return fkKey(objectType, keyName, key);
   }
-  if ("id" in selector) {
-    if (!isIndexValue(selector.id)) {
-      throw new TypeError(`eventKey: selector for "${selector.objectType}" has an undefined id; use { objectType } for the bucket`);
-    }
-    return idKey(selector.objectType, selector.id);
+  if (id !== undefined) return idKey(objectType, id);
+  if ("id" in selector || "key" in selector || "keyName" in selector) {
+    throw new TypeError(`eventKey: selector for "${objectType}" has an undefined id; use { objectType } for the bucket`);
   }
-  return bucketKey(selector.objectType);
+  return bucketKey(objectType);
 }
 
-type KeyShape = "bucket" | "id" | "fk";
+type ParsedKey =
+  | { shape: "bucket"; objectType: string }
+  | { shape: "id"; objectType: string; id: string }
+  | { shape: "fk"; objectType: string; keyName: string; value: string };
 
-/** Reads the shape and (escaped) type segment back out of a key. */
-function parseKey(key: string): { type: string; shape: KeyShape } {
-  const parts = key.split("/");
-  const shape: KeyShape = parts.length >= 3 ? "fk" : parts.length === 2 ? "id" : "bucket";
-  return { type: parts[0] ?? "", shape };
+/** Reads the shape and the unescaped segments back out of a key. */
+function parseKey(key: string): ParsedKey {
+  const parts = key.split("/").map(unescapeSegment);
+  const objectType = parts[0] ?? "";
+  if (parts.length >= 3) return { shape: "fk", objectType, keyName: parts[1]!, value: parts[2]! };
+  if (parts.length === 2) return { shape: "id", objectType, id: parts[1]! };
+  return { shape: "bucket", objectType };
 }
 
 // ---- action composition --------------------------------------------------------
@@ -253,7 +266,8 @@ function composeAction(prev: DataAction | undefined, next: DataAction): DataActi
     case "update":
       return next === "remove" ? "remove" : "update";
     case "remove":
-      return next === "remove" ? "remove" : "update";
+      // a late update for a deleted object must not resurrect it; a re-add makes it "changed"
+      return next === "add" ? "update" : "remove";
   }
 }
 
@@ -261,22 +275,28 @@ interface Pending {
   objectType: string;
   /** Net change per canonical (string) id; insertion order is delivery order. */
   changes: Map<string, DataChange>;
-  /** Sequence number of the newest broadcast that touched this batch. */
-  newestChange: number;
 }
 
-interface ShapeCounts {
-  id: number;
-  fk: number;
+/** Reference-counted set of watched values (canonical strings). */
+type Counts = Map<string, number>;
+
+function increment(counts: Counts, value: string): void {
+  counts.set(value, (counts.get(value) ?? 0) + 1);
+}
+
+function decrement(counts: Counts, value: string): void {
+  const n = (counts.get(value) ?? 0) - 1;
+  if (n <= 0) counts.delete(value);
+  else counts.set(value, n);
 }
 
 export class DataEventHandler {
   private readonly listeners = new Map<string, Set<Entry<DataEventBatch>>>();
-  /** Per (escaped) type: how many id-shaped and fk-shaped subscriptions exist. */
-  private readonly shapeCounts = new Map<string, ShapeCounts>();
+  /** Per objectType: which ids have a subscriber. Lets broadcasts skip building keys nobody watches. */
+  private readonly watchedIds = new Map<string, Counts>();
+  /** Per objectType, per foreign key: which values have a subscriber. */
+  private readonly watchedFks = new Map<string, Map<string, Counts>>();
   private pending = new Map<string, Pending>();
-  /** Incremented per broadcast; stamps subscriptions and batches. */
-  private seq = 0;
   private flushScheduled = false;
   private flushing = false;
   private flushRequested = false;
@@ -295,16 +315,16 @@ export class DataEventHandler {
       set = new Set();
       this.listeners.set(key, set);
     }
-    const entry: Entry<DataEventBatch> = { listener, since: this.seq };
+    const entry: Entry<DataEventBatch> = { listener };
     set.add(entry);
-    const { type, shape } = parseKey(key);
-    this.countShape(type, shape, +1);
+    const parsed = parseKey(key);
+    this.watch(parsed, +1);
 
     return () => {
       const current = this.listeners.get(key);
       if (!current?.delete(entry)) return; // already unsubscribed
       if (current.size === 0) this.listeners.delete(key);
-      this.countShape(type, shape, -1);
+      this.watch(parsed, -1);
     };
   }
 
@@ -313,26 +333,25 @@ export class DataEventHandler {
    * until the next microtask, then each key's listeners are called once.
    */
   broadcast({ objectType, action, objects, previous = [], index = "id", foreignKeys = [] }: BroadcastInput): void {
-    const type = bucketKey(objectType);
-    const counts = this.shapeCounts.get(type);
-    const wantBucket = this.listeners.has(type);
-    const wantId = (counts?.id ?? 0) > 0;
-    const wantFk = (counts?.fk ?? 0) > 0 && foreignKeys.length > 0;
-    if (!wantBucket && !wantId && !wantFk) return; // nobody could hear it: build nothing
+    const bucket = bucketKey(objectType);
+    const wantBucket = this.listeners.has(bucket);
+    const ids = this.watchedIds.get(objectType);
+    const fks = foreignKeys.length > 0 ? this.watchedFks.get(objectType) : undefined;
+    if (!wantBucket && !ids && !fks) return; // nobody could hear it: build nothing
 
-    const stamp = ++this.seq;
-    const previousById = wantFk && previous.length > 0 ? indexById(previous, index) : undefined;
+    const previousById = fks && previous.length > 0 ? indexById(previous, index) : undefined;
     let enqueued = false;
 
     for (const object of objects) {
       const id = object[index];
       if (!isIndexValue(id)) continue;
+      const canon = String(id);
 
-      if (wantBucket) enqueued = this.enqueue(type, objectType, id, action, stamp) || enqueued;
-      if (wantId) enqueued = this.enqueue(idKey(objectType, id), objectType, id, action, stamp) || enqueued;
-      if (wantFk) {
-        const before = previousById?.get(String(id));
-        enqueued = this.enqueueForeignKeys(objectType, action, id, object, before, foreignKeys, stamp) || enqueued;
+      if (wantBucket) enqueued = this.enqueue(bucket, objectType, id, action) || enqueued;
+      if (ids?.has(canon)) enqueued = this.enqueue(idKey(objectType, id), objectType, id, action) || enqueued;
+      if (fks) {
+        const before = previousById?.get(canon);
+        enqueued = this.enqueueForeignKeys(objectType, action, id, object, before, foreignKeys, fks) || enqueued;
       }
     }
 
@@ -377,12 +396,22 @@ export class DataEventHandler {
 
   // ---- internals ----------------------------------------------------------
 
-  private countShape(type: string, shape: KeyShape, delta: 1 | -1): void {
-    if (shape === "bucket") return;
-    const counts = this.shapeCounts.get(type) ?? { id: 0, fk: 0 };
-    counts[shape] += delta;
-    if (counts.id === 0 && counts.fk === 0) this.shapeCounts.delete(type);
-    else this.shapeCounts.set(type, counts);
+  private watch(parsed: ParsedKey, delta: 1 | -1): void {
+    const apply = delta === 1 ? increment : decrement;
+    if (parsed.shape === "id") {
+      let ids = this.watchedIds.get(parsed.objectType);
+      if (!ids) this.watchedIds.set(parsed.objectType, (ids = new Map()));
+      apply(ids, parsed.id);
+      if (ids.size === 0) this.watchedIds.delete(parsed.objectType);
+    } else if (parsed.shape === "fk") {
+      let fks = this.watchedFks.get(parsed.objectType);
+      if (!fks) this.watchedFks.set(parsed.objectType, (fks = new Map()));
+      let values = fks.get(parsed.keyName);
+      if (!values) fks.set(parsed.keyName, (values = new Map()));
+      apply(values, parsed.value);
+      if (values.size === 0) fks.delete(parsed.keyName);
+      if (fks.size === 0) this.watchedFks.delete(parsed.objectType);
+    }
   }
 
   private deliverPending(): void {
@@ -396,14 +425,16 @@ export class DataEventHandler {
     for (const [key, entry] of batches) {
       const listeners = this.listeners.get(key);
       if (!listeners || listeners.size === 0 || entry.changes.size === 0) continue;
-      deliver(listeners, toBatch(key, entry), this.onListenerError, { key }, entry.newestChange);
+      deliver(listeners, toBatch(key, entry), this.onListenerError, { key });
     }
   }
 
   /**
-   * Foreign-key keys for one object. With a `before` state, a changed value
+   * Foreign-key keys for one object, only for values somebody watches. With a
+   * `before` state and the key present in the written object, a changed value
    * means the object left one bucket (`remove` there) and entered another
-   * (`add` there); an unchanged value carries the write's own action.
+   * (`add` there). A key absent from the written object is unchanged and
+   * its value is taken from `before`. A `remove` is a `remove` everywhere.
    */
   private enqueueForeignKeys(
     objectType: string,
@@ -412,34 +443,38 @@ export class DataEventHandler {
     object: Record<string, unknown>,
     before: Record<string, unknown> | undefined,
     foreignKeys: readonly string[],
-    stamp: number,
+    watched: Map<string, Counts>,
   ): boolean {
     let enqueued = false;
     for (const fk of foreignKeys) {
-      const value = object[fk];
-      const oldValue = before?.[fk];
-      const changed = before !== undefined && canonical(oldValue) !== canonical(value);
+      const values = watched.get(fk);
+      if (!values) continue; // nobody watches this foreign key on this type
 
-      if (isIndexValue(value)) {
-        enqueued = this.enqueue(fkKey(objectType, fk, value), objectType, id, changed ? "add" : action, stamp) || enqueued;
+      const oldValue = before?.[fk];
+      const present = fk in object;
+      const value = present ? object[fk] : oldValue;
+      const differs = present && before !== undefined && canonical(oldValue) !== canonical(value);
+      // Moved between buckets: `add` into the new one — unless the object is being removed,
+      // in which case it is `remove` everywhere it was known.
+      const newBucketAction = action === "remove" ? "remove" : differs ? "add" : action;
+
+      if (isIndexValue(value) && values.has(String(value))) {
+        enqueued = this.enqueue(fkKey(objectType, fk, value), objectType, id, newBucketAction) || enqueued;
       }
-      if (changed && isIndexValue(oldValue)) {
-        enqueued = this.enqueue(fkKey(objectType, fk, oldValue), objectType, id, "remove", stamp) || enqueued;
+      if (differs && isIndexValue(oldValue) && values.has(String(oldValue))) {
+        enqueued = this.enqueue(fkKey(objectType, fk, oldValue), objectType, id, "remove") || enqueued;
       }
     }
     return enqueued;
   }
 
-  /** Queues `action` for `id` under `key` — only if someone listens to `key`. */
-  private enqueue(key: string, objectType: string, id: IndexValue, action: DataAction, stamp: number): boolean {
-    if (!this.listeners.has(key)) return false;
+  /** Queues `action` for `id` under `key`. Callers have already checked that `key` is watched. */
+  private enqueue(key: string, objectType: string, id: IndexValue, action: DataAction): boolean {
     let entry = this.pending.get(key);
     if (!entry) {
-      entry = { objectType, changes: new Map(), newestChange: stamp };
+      entry = { objectType, changes: new Map() };
       this.pending.set(key, entry);
     }
-    entry.newestChange = stamp;
-
     const canon = String(id);
     const existing = entry.changes.get(canon);
     const composed = composeAction(existing?.action, action);

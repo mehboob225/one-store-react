@@ -476,54 +476,44 @@ describe("DataEventHandler", () => {
     expect(bus.pendingKeys).toEqual([]);
   });
 
-  test("a subscriber never receives changes queued before it subscribed, even when another listener already queued the key (review 2, finding 1)", async () => {
+  test("pending batches go to whoever listens at flush time — a write between render and subscribe is not lost (review 3, finding 3)", async () => {
     const bus = new DataEventHandler();
     const early = mock(() => {});
     const late = mock(() => {});
     bus.subscribe({ objectType: "tasks", id: 1 }, early); // makes "tasks/1" a queued key
+    // a component reads the store here, then a write happens…
     bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] });
-    bus.subscribe({ objectType: "tasks", id: 1 }, late); // same tick, after the change
+    // …and only then does its effect subscribe
+    bus.subscribe({ objectType: "tasks", id: 1 }, late);
     await tick();
     expect(early).toHaveBeenCalledTimes(1);
-    expect(late).not.toHaveBeenCalled();
-
-    // but a change broadcast after it subscribed, merged into the same batch, does reach it
-    const later = mock(() => {});
-    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] });
-    bus.subscribe({ objectType: "tasks", id: 1 }, later);
-    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] });
-    await tick();
-    expect(later).toHaveBeenCalledTimes(1);
+    expect(late).toHaveBeenCalledTimes(1); // a redundant invalidation is cheap; a missed one is a stale screen
   });
 
-  test("StrictMode-style unsubscribe/resubscribe between a broadcast and its flush does not replay the change", async () => {
+  test("a StrictMode-style unsubscribe/resubscribe between a broadcast and its flush simply hears the batch", async () => {
     const bus = new DataEventHandler();
-    const other = mock(() => {});
     const seen = mock(() => {});
-    bus.subscribe({ objectType: "tasks" }, other);
     const off = bus.subscribe({ objectType: "tasks" }, seen);
     bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 1 }] });
     off();
     bus.subscribe({ objectType: "tasks" }, seen); // remount
     await tick();
-    expect(other).toHaveBeenCalledTimes(1);
-    expect(seen).not.toHaveBeenCalled();
+    expect(seen).toHaveBeenCalledTimes(1);
   });
 
-  test("a listener subscribed during a flush to a LATER key in that flush is not called (review 2, finding 2)", async () => {
+  test("a listener subscribed during a flush is not called by the pass in progress, but hears later batches of the same flush (review 2, finding 2)", async () => {
     const bus = new DataEventHandler();
-    const child = mock(() => {});
-    bus.subscribe({ objectType: "tasks", id: 7 }, () => {}); // "tasks/7" is already a queued key
+    const calls: string[] = [];
+    bus.subscribe({ objectType: "tasks", id: 7 }, () => calls.push("existing")); // "tasks/7" is a queued key
     bus.subscribe({ objectType: "tasks" }, () => {
-      bus.subscribe({ objectType: "tasks", id: 7 }, child); // parent listener mounts a child
+      calls.push("parent");
+      bus.subscribe({ objectType: "tasks", id: 7 }, () => calls.push("child")); // parent mounts a child
     });
     bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7 }] });
     await tick();
-    expect(child).not.toHaveBeenCalled();
-
-    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7 }] });
-    await tick();
-    expect(child).toHaveBeenCalledTimes(1);
+    // "tasks" was delivered first (parent subscribed the child), then "tasks/7": the child
+    // is on that key's live set, so it is called — and re-reads a store that is already current.
+    expect(calls).toEqual(["parent", "existing", "child"]);
   });
 
   test("numeric and string forms of an id are one change entry (review 2, finding 5)", async () => {
@@ -593,5 +583,89 @@ describe("DataEventHandler", () => {
     bus.broadcast({ objectType: "tasks", action: "add", objects: [object], foreignKeys: ["project_id"] });
     expect(fkReads).toBe(1);
     await tick();
+  });
+
+  test("a remove whose payload has a different foreign key than the stored copy is `remove` in BOTH buckets (review 3, finding 1)", async () => {
+    const bus = new DataEventHandler();
+    const batches: DataEventBatch[] = [];
+    bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => batches.push(b));
+    bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 43 }, (b) => batches.push(b));
+    bus.broadcast({
+      objectType: "tasks",
+      action: "remove",
+      objects: [{ id: 7, project_id: 43 }], // e.g. a delete push payload
+      previous: [{ id: 7, project_id: 42 }], // the stored copy
+      foreignKeys: ["project_id"],
+    });
+    await tick();
+    expect(Object.fromEntries(batches.map((b) => [b.key, b.changes]))).toEqual({
+      "tasks/project_id/43": [{ id: 7, action: "remove" }],
+      "tasks/project_id/42": [{ id: 7, action: "remove" }],
+    });
+  });
+
+  test("a foreign key absent from a partial update is unchanged: its bucket hears `update`, never `remove` (review 3, finding 2)", async () => {
+    const bus = new DataEventHandler();
+    const batches: DataEventBatch[] = [];
+    bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => batches.push(b));
+    bus.broadcast({
+      objectType: "tasks",
+      action: "update",
+      objects: [{ id: 7, title: "renamed" }], // no project_id field at all
+      previous: [{ id: 7, project_id: 42, title: "old" }],
+      foreignKeys: ["project_id"],
+    });
+    await tick();
+    expect(batches.map((b) => [b.key, b.changes])).toEqual([["tasks/project_id/42", [{ id: 7, action: "update" }]]]);
+  });
+
+  test("an id selector that also carries undefined foreign-key props is an id selector; a lone undefined id still throws (review 3, finding 6)", () => {
+    const props = { keyName: undefined as string | undefined, key: undefined as number | undefined };
+    expect(eventKey({ objectType: "tasks", id: 7, ...props } as never)).toBe("tasks/7");
+    expect(eventKey({ objectType: "tasks", keyName: "project_id", key: 1, id: undefined } as never)).toBe("tasks/project_id/1");
+    expect(() => eventKey({ objectType: "tasks", id: undefined } as never)).toThrow(/undefined id/);
+    expect(() => eventKey({ objectType: "tasks", keyName: "project_id", key: undefined } as never)).toThrow(/both keyName and key/);
+    expect(() => eventKey({ objectType: "tasks", key: 1 } as never)).toThrow(/both keyName and key/);
+  });
+
+  test("one id listener does not make a 500-object write build 500 id keys: only watched ids are queued (review 3, finding 7)", async () => {
+    const bus = new DataEventHandler();
+    bus.subscribe({ objectType: "tasks" }, () => {});
+    const watched = mock(() => {});
+    bus.subscribe({ objectType: "tasks", id: 250 }, watched);
+    bus.subscribe({ objectType: "tasks", id: 999 }, () => {}); // not in this write
+    bus.broadcast({ objectType: "tasks", action: "add", objects: tasks(500) });
+    expect(bus.pendingKeys).toEqual(["tasks", "tasks/250"]);
+    await tick();
+    expect(watched).toHaveBeenCalledTimes(1);
+  });
+
+  test("a foreign-key value nobody watches is never queued, and an unwatched foreign key is never read", async () => {
+    const bus = new DataEventHandler();
+    bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 2 }, () => {});
+    let assigneeReads = 0;
+    const object = new Proxy({ id: 1, project_id: 1, assignee_id: 1 } as Record<string, unknown>, {
+      get(target, prop, receiver) {
+        if (prop === "assignee_id") assigneeReads++;
+        return Reflect.get(target, prop, receiver);
+      },
+    });
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [object], foreignKeys: ["project_id", "assignee_id"] });
+    expect(bus.pendingKeys).toEqual([]); // project_id=1 is not watched (only 2 is)
+    expect(assigneeReads).toBe(0); // nobody watches assignee_id on tasks at all
+    await tick();
+  });
+
+  test("remove then update stays `remove`; remove then add is `update` (review 3, finding 9)", async () => {
+    const bus = new DataEventHandler();
+    const batches: DataEventBatch[] = [];
+    bus.subscribe({ objectType: "tasks" }, (b) => batches.push(b));
+
+    bus.broadcast({ objectType: "tasks", action: "remove", objects: [{ id: 7 }] });
+    bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7 }] }); // stale push after a delete
+    bus.broadcast({ objectType: "tasks", action: "remove", objects: [{ id: 8 }] });
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 8 }] }); // re-created
+    await tick();
+    expect(batches[0]!.changes).toEqual([{ id: 7, action: "remove" }, { id: 8, action: "update" }]);
   });
 });
