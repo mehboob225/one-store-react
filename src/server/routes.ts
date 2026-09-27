@@ -71,6 +71,10 @@ export function createRoutes(ctx: RouteContext) {
 
     // ---- users -----------------------------------------------------------
 
+    "/api/v1/users": {
+      GET: authed<"/api/v1/users">(() => Response.json({ users: db.listUsers() })),
+    },
+
     "/api/v1/users/current": {
       GET: authed<"/api/v1/users/current">((_req, userId) => {
         const user = db.getUser(userId);

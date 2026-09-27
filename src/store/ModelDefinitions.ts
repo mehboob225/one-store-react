@@ -20,18 +20,26 @@
  *                      → getX() accessor, grouped index, "type/fk/value" events.
  *                      DECLARE EVERY FK YOU WILL FILTER OR SUBSCRIBE BY.
  *   foreignKeysArray   id arrays: field → { objectType, getter } → getX(): Model[]
- *   relatedObjectType  children: childType → { key, getter, cascadeDelete? }
+ *   relatedObjectType  children, keyed by RELATION NAME (a type may have several
+ *                      relations to the same child type):
+ *                      name → { objectType, key, getter, cascadeDelete? }
  *                      key is the child's FK field pointing at this type
- *   hasMany            many-to-many: otherType → { through, thisKey, otherKey, getter }
+ *   hasMany            many-to-many, keyed by relation name:
+ *                      name → { objectType, through, thisKey, otherKey, getter }
  *   embeddedObject     response field → objectType; lifted into that bucket
  *   belongsTo          buckets whose derived indexes must be invalidated when
  *                      this type is written (join tables list both sides)
  *   metaData           opt-in keys of per-object side data (saveMetaData)
  *
- * Foreign-key VALUES must be non-empty strings, finite numbers or null, and
- * `foreignKeysArray` values arrays of those: the event bus ignores anything
- * else, silently, and generated accessors would misbehave.
- * `assertForeignKeyValues` enforces both on write.
+ * VALUES: the index and every single foreign key must be a non-empty string or
+ * a finite number (foreign keys may also be null); `foreignKeysArray` values
+ * are arrays of those. Nothing downstream validates this — the event bus
+ * accepts any string or number (NaN and "" included) and skips other types
+ * without a word — so `assertForeignKeyValues` enforces it on write. Only
+ * single foreign keys reach the event bus and the grouped indexes; array keys
+ * have accessors but no per-value subscriptions.
+ *
+ * The exported map is deep-frozen; `definitionFor` returns a readonly view.
  */
 
 export interface ForeignKeyDefinition {
@@ -45,6 +53,8 @@ export interface ForeignKeyDefinition {
 export type ForeignKeysArrayDefinition = ForeignKeyDefinition;
 
 export interface RelatedObjectTypeDefinition {
+  /** The child bucket. */
+  objectType: string;
   /** The child's foreign-key field that points at this type. */
   key: string;
   /** Name of the generated accessor, e.g. "getTasks". */
@@ -54,6 +64,8 @@ export interface RelatedObjectTypeDefinition {
 }
 
 export interface HasManyDefinition {
+  /** The other side's bucket. */
+  objectType: string;
   /** The join bucket. */
   through: string;
   /** Join field pointing at this type. */
@@ -81,7 +93,7 @@ export interface ModelDefinition {
 // your own project; keep the shape. Every property above is exercised here.
 // ---------------------------------------------------------------------------
 
-export const ModelDefinitions = {
+export const ModelDefinitions = deepFreeze({
   users: {
     index: "id",
     model: "UserModel",
@@ -104,7 +116,7 @@ export const ModelDefinitions = {
       member_ids: { objectType: "users", getter: "getMembers" },
     },
     relatedObjectType: {
-      tasks: { key: "project_id", getter: "getTasks", cascadeDelete: true },
+      tasks: { objectType: "tasks", key: "project_id", getter: "getTasks", cascadeDelete: true },
     },
   },
 
@@ -116,12 +128,12 @@ export const ModelDefinitions = {
       assignee_id: { objectType: "users", getter: "getAssignee" },
     },
     relatedObjectType: {
-      comments: { key: "task_id", getter: "getComments", cascadeDelete: true },
+      comments: { objectType: "comments", key: "task_id", getter: "getComments", cascadeDelete: true },
       // the server deletes a task's tag links with it; the client must too
-      task_tags_relation: { key: "task_id", getter: "getTagLinks", cascadeDelete: true },
+      tagLinks: { objectType: "task_tags_relation", key: "task_id", getter: "getTagLinks", cascadeDelete: true },
     },
     hasMany: {
-      tags: { through: "task_tags_relation", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" },
+      tags: { objectType: "tags", through: "task_tags_relation", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" },
     },
     embeddedObject: {
       assignee: "users",
@@ -141,10 +153,10 @@ export const ModelDefinitions = {
     index: "id",
     model: "TagModel",
     relatedObjectType: {
-      task_tags_relation: { key: "tag_id", getter: "getTaskLinks", cascadeDelete: true },
+      taskLinks: { objectType: "task_tags_relation", key: "tag_id", getter: "getTaskLinks", cascadeDelete: true },
     },
     hasMany: {
-      tasks: { through: "task_tags_relation", thisKey: "tag_id", otherKey: "task_id", getter: "getTasks" },
+      tasks: { objectType: "tasks", through: "task_tags_relation", thisKey: "tag_id", otherKey: "task_id", getter: "getTasks" },
     },
   },
 
@@ -157,7 +169,22 @@ export const ModelDefinitions = {
     },
     belongsTo: ["tasks", "tags"],
   },
-} as const satisfies Record<string, ModelDefinition>;
+} as const satisfies Record<string, ModelDefinition>);
+
+/** Recursively readonly: what runtime consumers get from `definitionFor`. */
+export type DeepReadonly<T> = T extends (infer U)[]
+  ? readonly DeepReadonly<U>[]
+  : T extends object
+    ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+    : T;
+
+function deepFreeze<T>(value: T): T {
+  if (typeof value === "object" && value !== null && !Object.isFrozen(value)) {
+    Object.freeze(value);
+    for (const inner of Object.values(value as Record<string, unknown>)) deepFreeze(inner);
+  }
+  return value;
+}
 
 /** Every bucket name. Use this wherever an object type is named. */
 export type ObjectType = keyof typeof ModelDefinitions;
@@ -168,8 +195,8 @@ export function isObjectType(value: unknown): value is ObjectType {
   return typeof value === "string" && Object.hasOwn(ModelDefinitions, value);
 }
 
-/** The definition for a bucket, typed loosely for runtime consumers. */
-export function definitionFor(objectType: ObjectType): ModelDefinition {
+/** The definition for a bucket, as a readonly view for runtime consumers. */
+export function definitionFor(objectType: ObjectType): DeepReadonly<ModelDefinition> {
   return ModelDefinitions[objectType];
 }
 
@@ -188,6 +215,11 @@ export function foreignKeyArrayNames(objectType: ObjectType): string[] {
 // ---------------------------------------------------------------------------
 
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+
+/** Own-property lookup: a field named "constructor" or "toString" must not resolve to Object.prototype. */
+function own<T>(record: Record<string, T> | undefined, key: string): T | undefined {
+  return record !== undefined && Object.hasOwn(record, key) ? record[key] : undefined;
+}
 
 /**
  * Checks a definitions map for internal consistency. Returns a list of
@@ -249,7 +281,9 @@ function claimGetter(ctx: TypeContext, getter: string, owner: string): void {
 
 function checkNameAndIndex(ctx: TypeContext): void {
   if (!IDENTIFIER.test(ctx.type)) ctx.problems.push(`"${ctx.type}" is not a valid object type name`);
-  if (typeof ctx.def.index !== "string" || ctx.def.index === "") problem(ctx, "index must be a non-empty field name");
+  const { index } = ctx.def;
+  if (typeof index !== "string" || index === "") problem(ctx, "index must be a non-empty field name");
+  else if (!IDENTIFIER.test(index)) problem(ctx, `index "${index}" is not a valid identifier`);
 }
 
 function checkModel(ctx: TypeContext): void {
@@ -265,7 +299,7 @@ function checkModel(ctx: TypeContext): void {
 function checkPointers(ctx: TypeContext, property: string, pointers: Record<string, ForeignKeyDefinition> | undefined): void {
   for (const [field, fk] of Object.entries(pointers ?? {})) {
     if (!IDENTIFIER.test(field)) problem(ctx, `${property} field "${field}" is not a valid identifier`);
-    if (property === "foreignKeysArray" && ctx.def.foreignKeys?.[field]) {
+    if (property === "foreignKeysArray" && own(ctx.def.foreignKeys, field)) {
       problem(ctx, `"${field}" is declared in both foreignKeys and foreignKeysArray`);
     }
     if (!isKnown(ctx, fk.objectType)) problem(ctx, `${property}.${field} points at unknown type "${fk.objectType}"`);
@@ -273,33 +307,37 @@ function checkPointers(ctx: TypeContext, property: string, pointers: Record<stri
   }
 }
 
-/** Each child type must declare `key` as a foreign key pointing back at this type. */
+/** Each relation names a child type that declares `key` as a foreign key pointing back at this type. */
 function checkRelatedObjectTypes(ctx: TypeContext): void {
-  for (const [childType, rel] of Object.entries(ctx.def.relatedObjectType ?? {})) {
-    claimGetter(ctx, rel.getter, `relatedObjectType.${childType}`);
-    if (!IDENTIFIER.test(rel.key)) problem(ctx, `relatedObjectType.${childType}.key "${rel.key}" is not a valid identifier`);
-    if (!isKnown(ctx, childType)) {
-      problem(ctx, `relatedObjectType.${childType} is not a known type`);
+  for (const [name, rel] of Object.entries(ctx.def.relatedObjectType ?? {})) {
+    const label = `relatedObjectType.${name}`;
+    if (!IDENTIFIER.test(name)) problem(ctx, `${label}: relation name is not a valid identifier`);
+    claimGetter(ctx, rel.getter, label);
+    if (!IDENTIFIER.test(rel.key)) problem(ctx, `${label}.key "${rel.key}" is not a valid identifier`);
+    if (!isKnown(ctx, rel.objectType)) {
+      problem(ctx, `${label}.objectType "${rel.objectType}" is not a known type`);
       continue;
     }
-    const childFk = ctx.definitions[childType]!.foreignKeys?.[rel.key];
+    const childFk = own(ctx.definitions[rel.objectType]!.foreignKeys, rel.key);
     if (!childFk) {
-      problem(ctx, `relatedObjectType.${childType}.key "${rel.key}" is not declared in ${childType}.foreignKeys (grouped index + events need it)`);
+      problem(ctx, `${label}.key "${rel.key}" is not declared in ${rel.objectType}.foreignKeys (grouped index + events need it)`);
     } else if (childFk.objectType !== ctx.type) {
-      problem(ctx, `relatedObjectType.${childType}.key "${rel.key}" points at ${childFk.objectType}, not ${ctx.type}`);
+      problem(ctx, `${label}.key "${rel.key}" points at ${childFk.objectType}, not ${ctx.type}`);
     }
   }
 }
 
 function checkHasMany(ctx: TypeContext): void {
-  for (const [otherType, hm] of Object.entries(ctx.def.hasMany ?? {})) checkHasManyEntry(ctx, otherType, hm);
+  for (const [name, hm] of Object.entries(ctx.def.hasMany ?? {})) checkHasManyEntry(ctx, name, hm);
 }
 
 /** The join bucket must declare both keys, pointing at the right types, and list this type in `belongsTo`. */
-function checkHasManyEntry(ctx: TypeContext, otherType: string, hm: HasManyDefinition): void {
-  const label = `hasMany.${otherType}`;
+function checkHasManyEntry(ctx: TypeContext, name: string, hm: HasManyDefinition): void {
+  const label = `hasMany.${name}`;
+  const otherType = hm.objectType;
+  if (!IDENTIFIER.test(name)) problem(ctx, `${label}: relation name is not a valid identifier`);
   claimGetter(ctx, hm.getter, label);
-  if (!isKnown(ctx, otherType)) problem(ctx, `${label} is not a known type`);
+  if (!isKnown(ctx, otherType)) problem(ctx, `${label}.objectType "${otherType}" is not a known type`);
   if (!isKnown(ctx, hm.through)) {
     problem(ctx, `${label}.through "${hm.through}" is not a known type`);
     return;
@@ -317,7 +355,7 @@ function checkHasManyEntry(ctx: TypeContext, otherType: string, hm: HasManyDefin
 }
 
 function checkJoinKey(ctx: TypeContext, label: string, throughType: string, through: ModelDefinition, key: string, expected: string): void {
-  const fk = through.foreignKeys?.[key];
+  const fk = own(through.foreignKeys, key);
   if (!fk) problem(ctx, `${label}: ${throughType} does not declare foreignKeys.${key}`);
   else if (fk.objectType !== expected) problem(ctx, `${label}: ${throughType}.${key} points at ${fk.objectType}, not ${expected}`);
 }
@@ -328,8 +366,8 @@ function checkEmbeddedObjects(ctx: TypeContext): void {
   for (const [field, target] of Object.entries(def.embeddedObject ?? {})) {
     if (!IDENTIFIER.test(field)) problem(ctx, `embeddedObject field "${field}" is not a valid identifier`);
     if (field === def.index) problem(ctx, `embeddedObject.${field} is the index field`);
-    if (def.foreignKeys?.[field]) problem(ctx, `embeddedObject.${field} is also declared in foreignKeys`);
-    if (def.foreignKeysArray?.[field]) problem(ctx, `embeddedObject.${field} is also declared in foreignKeysArray`);
+    if (own(def.foreignKeys, field)) problem(ctx, `embeddedObject.${field} is also declared in foreignKeys`);
+    if (own(def.foreignKeysArray, field)) problem(ctx, `embeddedObject.${field} is also declared in foreignKeysArray`);
     if (!isKnown(ctx, target)) problem(ctx, `embeddedObject.${field} points at unknown type "${target}"`);
   }
 }
@@ -370,18 +408,23 @@ export function isForeignKeyArrayValue(value: unknown): value is (string | numbe
 }
 
 /**
- * Checks one record's declared foreign-key fields (single and array).
- * Returns the offending field names; empty means fine. The cache calls this
- * on write so a boolean, NaN or nested object in a foreign-key field fails
- * loudly instead of silently never notifying anyone.
+ * Checks one record's index field and declared foreign-key fields (single
+ * and array). Returns the offending field names; empty means fine. The
+ * cache calls this on write so a boolean, NaN or nested object in one of
+ * those fields fails loudly instead of silently never notifying anyone.
+ * The index is required and may not be null; foreign keys may be absent
+ * (partial update) or null.
  */
 export function invalidForeignKeyFields(objectType: ObjectType, record: Record<string, unknown>): string[] {
   const bad: string[] = [];
+  const { index } = definitionFor(objectType);
+  const id = own(record, index);
+  if (id === null || id === undefined || !isForeignKeyValue(id)) bad.push(index);
   for (const field of foreignKeyNames(objectType)) {
-    if (field in record && !isForeignKeyValue(record[field])) bad.push(field);
+    if (Object.hasOwn(record, field) && !isForeignKeyValue(record[field])) bad.push(field);
   }
   for (const field of foreignKeyArrayNames(objectType)) {
-    if (field in record && !isForeignKeyArrayValue(record[field])) bad.push(field);
+    if (Object.hasOwn(record, field) && !isForeignKeyArrayValue(record[field])) bad.push(field);
   }
   return bad;
 }
@@ -390,8 +433,8 @@ export function assertForeignKeyValues(objectType: ObjectType, record: Record<st
   const bad = invalidForeignKeyFields(objectType, record);
   if (bad.length > 0) {
     throw new TypeError(
-      `${objectType} record has invalid foreign key value(s): ${bad.join(", ")} ` +
-        "(single keys must be a non-empty string, a finite number or null; array keys an array of those)",
+      `${objectType} record has invalid index/foreign key value(s): ${bad.join(", ")} ` +
+        "(the index must be a non-empty string or finite number; single keys may also be null; array keys an array of those)",
     );
   }
 }

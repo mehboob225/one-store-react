@@ -54,14 +54,48 @@ describe("the real ModelDefinitions", () => {
   });
 
   test("deleting a task or a tag cascades to its join rows, matching the server (review finding 1)", () => {
-    expect(definitionFor("tasks").relatedObjectType?.task_tags_relation).toEqual({ key: "task_id", getter: "getTagLinks", cascadeDelete: true });
-    expect(definitionFor("tags").relatedObjectType?.task_tags_relation).toEqual({ key: "tag_id", getter: "getTaskLinks", cascadeDelete: true });
+    expect(definitionFor("tasks").relatedObjectType?.tagLinks).toEqual({ objectType: "task_tags_relation", key: "task_id", getter: "getTagLinks", cascadeDelete: true });
+    expect(definitionFor("tags").relatedObjectType?.taskLinks).toEqual({ objectType: "task_tags_relation", key: "tag_id", getter: "getTaskLinks", cascadeDelete: true });
   });
 
   test("objectTypes is frozen (review finding 9)", () => {
     expect(Object.isFrozen(objectTypes)).toBe(true);
     // @ts-expect-error readonly
     expect(() => objectTypes.push("ghosts")).toThrow();
+  });
+
+  test("the schema is deep-frozen and definitionFor returns a readonly view (review 2, finding 6)", () => {
+    expect(Object.isFrozen(ModelDefinitions)).toBe(true);
+    expect(Object.isFrozen(ModelDefinitions.tasks.foreignKeys)).toBe(true);
+    expect(Object.isFrozen(ModelDefinitions.task_tags_relation.belongsTo)).toBe(true);
+    const def = definitionFor("tasks");
+    // @ts-expect-error readonly
+    expect(() => (def.foreignKeys!.x = { objectType: "users", getter: "getX" })).toThrow(TypeError);
+    // @ts-expect-error readonly
+    expect(() => delete definitionFor("projects").relatedObjectType).toThrow(TypeError);
+    expect(validateModelDefinitions(ModelDefinitions)).toEqual([]); // still intact
+  });
+
+  test("a type may declare several relations to the same child type (review 2, finding 4)", () => {
+    expect(
+      validateModelDefinitions({
+        users: {
+          index: "id",
+          model: "UserModel",
+          relatedObjectType: {
+            assignedTasks: { objectType: "tasks", key: "assignee_id", getter: "getAssignedTasks" },
+            createdTasks: { objectType: "tasks", key: "creator_id", getter: "getCreatedTasks" },
+          },
+        },
+        tasks: {
+          index: "id",
+          foreignKeys: {
+            assignee_id: { objectType: "users", getter: "getAssignee" },
+            creator_id: { objectType: "users", getter: "getCreator" },
+          },
+        },
+      }),
+    ).toEqual([]);
   });
 });
 
@@ -82,8 +116,8 @@ describe("validateModelDefinitions", () => {
         index: "id",
         foreignKeys: { project_id: { objectType: "projectz", getter: "getProject" } },
         foreignKeysArray: { watcher_ids: { objectType: "people", getter: "getWatchers" } },
-        relatedObjectType: { commentz: { key: "task_id", getter: "getComments" } },
-        hasMany: { tags: { through: "nope", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } },
+        relatedObjectType: { comments: { objectType: "commentz", key: "task_id", getter: "getComments" } },
+        hasMany: { tags: { objectType: "tagz", through: "nope", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } },
         embeddedObject: { assignee: "nobody" },
         belongsTo: ["ghosts"],
       },
@@ -91,28 +125,34 @@ describe("validateModelDefinitions", () => {
     expect(problems).toEqual([
       'tasks: foreignKeys.project_id points at unknown type "projectz"',
       'tasks: foreignKeysArray.watcher_ids points at unknown type "people"',
-      "tasks: relatedObjectType.commentz is not a known type",
-      "tasks: hasMany.tags is not a known type",
+      'tasks: relatedObjectType.comments.objectType "commentz" is not a known type',
+      'tasks: hasMany.tags.objectType "tagz" is not a known type',
       'tasks: hasMany.tags.through "nope" is not a known type',
       'tasks: embeddedObject.assignee points at unknown type "nobody"',
       'tasks: belongsTo includes unknown type "ghosts"',
     ]);
   });
 
-  test("relatedObjectType requires the child to declare the key as a foreign key pointing back", () => {
+  test("relatedObjectType requires a known child that declares the key as a foreign key pointing back", () => {
     expect(
       withDefs({
         tasks: { index: "id", foreignKeys: { owner_id: { objectType: "users", getter: "getOwner" } } },
-        users: { index: "id", model: "UserModel", relatedObjectType: { tasks: { key: "assignee_id", getter: "getTasks" } } },
+        users: { index: "id", model: "UserModel", relatedObjectType: { tasks: { objectType: "tasks", key: "assignee_id", getter: "getTasks" } } },
       }),
     ).toEqual(['users: relatedObjectType.tasks.key "assignee_id" is not declared in tasks.foreignKeys (grouped index + events need it)']);
 
     expect(
       withDefs({
         tasks: { index: "id", foreignKeys: { project_id: { objectType: "projects", getter: "getProject" } } },
-        users: { index: "id", model: "UserModel", relatedObjectType: { tasks: { key: "project_id", getter: "getTasks" } } },
+        users: { index: "id", model: "UserModel", relatedObjectType: { tasks: { objectType: "tasks", key: "project_id", getter: "getTasks" } } },
       }),
     ).toEqual(['users: relatedObjectType.tasks.key "project_id" points at projects, not users']);
+
+    expect(
+      withDefs({
+        users: { index: "id", model: "UserModel", relatedObjectType: { "my tasks": { objectType: "taskz", key: "owner_id", getter: "getTasks" } } },
+      }),
+    ).toEqual(["users: relatedObjectType.my tasks: relation name is not a valid identifier", 'users: relatedObjectType.my tasks.objectType "taskz" is not a known type']);
   });
 
   test("hasMany requires the join bucket to declare both keys, pointing at the right types, and belongsTo", () => {
@@ -120,7 +160,7 @@ describe("validateModelDefinitions", () => {
     const tags: ModelDefinition = { index: "id", model: "TagModel" };
     const tasks: ModelDefinition = {
       index: "id",
-      hasMany: { tags: { through: "task_tags", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } },
+      hasMany: { tags: { objectType: "tags", through: "task_tags", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } },
     };
 
     expect(withDefs({ tasks, tags, task_tags: join({}) })).toEqual([
@@ -181,7 +221,7 @@ describe("validateModelDefinitions", () => {
           foreignKeysArray: { "watcher ids": { objectType: "users", getter: "getWatchers" } },
         },
         comments: { index: "id", foreignKeys: { "task-id": { objectType: "tasks", getter: "getTask" } } },
-        users: { index: "id", model: "UserModel", relatedObjectType: { comments: { key: "task-id", getter: "getComments" } } },
+        users: { index: "id", model: "UserModel", relatedObjectType: { comments: { objectType: "comments", key: "task-id", getter: "getComments" } } },
       }).sort(),
     ).toEqual(
       [
@@ -211,11 +251,11 @@ describe("validateModelDefinitions", () => {
         users: {
           index: "id",
           model: "UserModel",
-          hasMany: { users: { through: "friendships", thisKey: "user_id", otherKey: "user_id", getter: "getFriends" } },
+          hasMany: { friends: { objectType: "users", through: "friendships", thisKey: "user_id", otherKey: "user_id", getter: "getFriends" } },
         },
         friendships: { index: "id", foreignKeys: { user_id: { objectType: "users", getter: "getUser" } }, belongsTo: ["users"] },
       }),
-    ).toEqual(['users: hasMany.users: thisKey and otherKey are both "user_id"']);
+    ).toEqual(['users: hasMany.friends: thisKey and otherKey are both "user_id"']);
   });
 
   test("an embedded field must not be the index or a foreign-key field (review finding 4)", () => {
@@ -236,12 +276,33 @@ describe("validateModelDefinitions", () => {
     ]);
   });
 
-  test("index, type names and metaData keys are checked", () => {
-    expect(validateModelDefinitions({ "bad-name": { index: "" , metaData: ["ok", "not ok"] } })).toEqual([
+  test("index, type names and metaData keys are checked; the index must be an identifier (review 2, finding 7)", () => {
+    expect(validateModelDefinitions({ "bad-name": { index: "", metaData: ["ok", "not ok"] } })).toEqual([
       '"bad-name" is not a valid object type name',
       "bad-name: index must be a non-empty field name",
       'bad-name: metaData key "not ok" is not a valid identifier',
     ]);
+    expect(validateModelDefinitions({ things: { index: "task-id" } })).toEqual(['things: index "task-id" is not a valid identifier']);
+    expect(validateModelDefinitions({ things: { index: "my id" } })).toEqual(['things: index "my id" is not a valid identifier']);
+  });
+
+  test("fields named like Object.prototype members are looked up as own properties (review 2, finding 5)", () => {
+    expect(
+      withDefs({
+        tasks: {
+          index: "id",
+          foreignKeys: { constructor: { objectType: "users", getter: "getConstructor" } },
+          foreignKeysArray: { toString: { objectType: "users", getter: "getToStrings" } },
+          embeddedObject: { valueOf: "users" },
+        },
+      }),
+    ).toEqual([]);
+    expect(
+      withDefs({
+        tasks: { index: "id", hasMany: { tags: { objectType: "users", through: "joins", thisKey: "constructor", otherKey: "valueOf", getter: "getTags" } } },
+        joins: { index: "id", belongsTo: ["tasks"] },
+      }),
+    ).toEqual(["tasks: hasMany.tags: joins does not declare foreignKeys.constructor", "tasks: hasMany.tags: joins does not declare foreignKeys.valueOf"]);
   });
 
   test("assertValidModelDefinitions throws with every problem listed", () => {
@@ -262,7 +323,17 @@ describe("foreign-key values", () => {
     for (const bad of ["1,2", 3, [{ id: 1 }], [1, null], [NaN], [""], {}]) expect(isForeignKeyArrayValue(bad)).toBe(false);
   });
 
-  test("invalidForeignKeyFields covers both kinds and ignores absent fields", () => {
+  test("the index is required and checked with the same rules (review 2, finding 3)", () => {
+    for (const id of [NaN, "", null, undefined, { id: 1 }, [1], true]) {
+      expect(invalidForeignKeyFields("tasks", { id, project_id: 1 })).toEqual(["id"]);
+    }
+    expect(invalidForeignKeyFields("tasks", { project_id: 1 })).toEqual(["id"]); // absent
+    expect(invalidForeignKeyFields("task_tags_relation", { id: "7-3", task_id: 7, tag_id: 3 })).toEqual([]);
+    expect(invalidForeignKeyFields("tasks", Object.create({ id: 1 }) as Record<string, unknown>)).toEqual(["id"]); // inherited id does not count
+    expect(() => assertForeignKeyValues("tasks", { id: NaN })).toThrow(/invalid index\/foreign key value\(s\): id/);
+  });
+
+  test("invalidForeignKeyFields covers both kinds and ignores absent foreign keys", () => {
     expect(invalidForeignKeyFields("tasks", { id: 1, project_id: 1, assignee_id: null })).toEqual([]);
     expect(invalidForeignKeyFields("tasks", { id: 1, project_id: "1" })).toEqual([]);
     expect(invalidForeignKeyFields("tasks", { id: 1, project_id: { id: 1 }, assignee_id: true })).toEqual(["project_id", "assignee_id"]);
@@ -275,7 +346,7 @@ describe("foreign-key values", () => {
   });
 
   test("assertForeignKeyValues names the fields", () => {
-    expect(() => assertForeignKeyValues("tasks", { id: 1, project_id: false })).toThrow(/tasks record has invalid foreign key value\(s\): project_id/);
+    expect(() => assertForeignKeyValues("tasks", { id: 1, project_id: false })).toThrow(/tasks record has invalid index\/foreign key value\(s\): project_id/);
     expect(() => assertForeignKeyValues("projects", { id: 1, member_ids: 3 })).toThrow(/member_ids/);
     expect(() => assertForeignKeyValues("tasks", { id: 1, project_id: 2 })).not.toThrow();
   });

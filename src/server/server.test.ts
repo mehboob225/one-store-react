@@ -87,6 +87,14 @@ describe("auth", () => {
 });
 
 describe("users", () => {
+  test("GET /users lists every user in the public representation (fills the users bucket)", async () => {
+    const body = (await (await api("/users")).json()) as { users: Record<string, unknown>[] };
+    expect(body.users.map((u) => u.id)).toEqual([1, 2]);
+    for (const u of body.users) {
+      expect(Object.keys(u).sort()).toEqual(["email", "id", "name"]);
+    }
+  });
+
   test("GET /users/current returns user and current_user buckets", async () => {
     const body = (await (await api("/users/current")).json()) as Record<string, Record<string, unknown>>;
     expect(body.user!.id).toBe(1);
@@ -148,15 +156,18 @@ describe("users", () => {
 });
 
 describe("projects and tasks", () => {
-  test("GET /projects lists projects", async () => {
-    const body = (await (await api("/projects")).json()) as { projects: { id: number }[] };
+  test("GET /projects lists projects with owner_id and member_ids", async () => {
+    const body = (await (await api("/projects")).json()) as { projects: { id: number; owner_id: number; member_ids: number[] }[] };
     expect(body.projects.map((p) => p.id)).toEqual([1, 2]);
+    expect(body.projects.map((p) => [p.owner_id, p.member_ids])).toEqual([
+      [1, [1, 2]],
+      [2, [2]],
+    ]);
   });
 
-  test("GET /projects/:id returns a single project or 404", async () => {
-    expect(((await (await api("/projects/1")).json()) as { project: { name: string } }).project.name).toBe(
-      "Analytical Engine",
-    );
+  test("GET /projects/:id returns a single project (with owner_id and member_ids) or 404", async () => {
+    const { project } = (await (await api("/projects/1")).json()) as { project: Record<string, unknown> };
+    expect(project).toMatchObject({ name: "Analytical Engine", owner_id: 1, member_ids: [1, 2] });
     expect((await api("/projects/99")).status).toBe(404);
   });
 

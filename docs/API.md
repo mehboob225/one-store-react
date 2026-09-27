@@ -36,6 +36,7 @@ shapes, or the factories (step 11) are the place to adapt.
 |---|---|---|---|---|
 | POST | `/sign_in` | `{email, password}` (non-empty strings) | `{uuid, token, user}`, `400` on a bad body | — |
 | DELETE | `/sign_out` | — | `{ok: true}`; that session's sockets get `session_invalid` and close | — |
+| GET | `/users` | — | `{users: []}` (public users: `id`, `name`, `email`) — fills the `users` bucket so `owner_id`, `member_ids`, `author_id` resolve | — |
 | GET | `/users/current` | — | `{user, current_user}` (`current_user` carries `settings`) | — |
 | PUT | `/users/current/settings` | `{settings}` (plain object) | `{current_user}` (settings merged), `400` otherwise | `update current_user` **to that user only** |
 | GET | `/projects` | — | `{projects: []}` (each with `owner_id`, `member_ids`) | — |

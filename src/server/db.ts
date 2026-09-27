@@ -69,6 +69,11 @@ export class Database {
     return this.data.users.find((u) => u.email === email);
   }
 
+  /** Every user, public representation. Fills the `users` bucket so owner/member/author keys resolve. */
+  listUsers(): PublicUser[] {
+    return this.data.users.map(publicUser);
+  }
+
   getUser(id: number): PublicUser | undefined {
     const user = this.data.users.find((u) => u.id === id);
     return user ? publicUser(user) : undefined;
