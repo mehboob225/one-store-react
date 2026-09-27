@@ -42,7 +42,7 @@ function validateTaskField(field: MutableTaskField, value: unknown): string | un
 /** Copies the mutable fields present in `body` into `target`, validating each. */
 function collectTaskFields(body: Record<string, unknown>, target: Record<string, unknown>): string | undefined {
   for (const field of MUTABLE_TASK_FIELDS) {
-    if (!(field in body)) continue;
+    if (!Object.hasOwn(body, field)) continue; // own properties only, like every other field read in this codebase
     const problem = validateTaskField(field, body[field]);
     if (problem) return problem;
     target[field] = body[field];
@@ -53,7 +53,7 @@ function collectTaskFields(body: Record<string, unknown>, target: Record<string,
 /** `POST /projects/:id/tasks` body (`task`): title required, other fields optional. */
 export function validateNewTask(input: unknown): Validated<NewTask> {
   if (!isPlainObject(input)) return fail("task must be an object");
-  if (!("title" in input)) return fail("task.title is required");
+  if (!Object.hasOwn(input, "title")) return fail("task.title is required");
   const value: Record<string, unknown> = {};
   const problem = collectTaskFields(input, value);
   return problem ? fail(problem) : ok(value as unknown as NewTask);
@@ -62,12 +62,13 @@ export function validateNewTask(input: unknown): Validated<NewTask> {
 /**
  * `PUT /tasks/:id` body (`task`), step one — the envelope: an object carrying
  * a string `hash`. Checked BEFORE the hash comparison, so a request without a
- * hash is reported as malformed (400), never as a conflict.
+ * hash is reported as malformed (400), never as a conflict. Returns the
+ * narrowed body so the field step needs no cast.
  */
-export function validateTaskEnvelope(input: unknown): Validated<{ hash: string }> {
+export function validateTaskEnvelope(input: unknown): Validated<{ hash: string; body: Record<string, unknown> }> {
   if (!isPlainObject(input)) return fail("task must be an object");
   if (typeof input.hash !== "string") return fail("task.hash must be a string");
-  return ok({ hash: input.hash });
+  return ok({ hash: input.hash, body: input });
 }
 
 /**

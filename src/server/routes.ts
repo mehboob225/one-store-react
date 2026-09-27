@@ -25,6 +25,7 @@ type Handler<P extends string> = (req: BunRequest<P>) => Response | Promise<Resp
 
 const notFound = (what: string) => Response.json({ error: `${what} not found` }, { status: 404 });
 const badRequest = (message: string) => Response.json({ error: message }, { status: 400 });
+const forbidden = () => Response.json({ error: "not a member of this project" }, { status: 403 });
 
 async function json<T>(req: Request): Promise<T | undefined> {
   try {
@@ -117,14 +118,16 @@ export function createRoutes(ctx: RouteContext) {
         const tasks = db.listTasks(projectId).map((t) => db.withAssignee(t));
         return Response.json({ tasks });
       }),
-      POST: authed<"/api/v1/projects/:id/tasks">(async (req) => {
+      POST: authed<"/api/v1/projects/:id/tasks">(async (req, userId) => {
         const projectId = Number(req.params.id);
         const body = await json<{ task?: unknown }>(req);
-        // The db validates and applies the assignee rule itself: 404, then 400, then the write.
-        const outcome = db.createTask(projectId, body?.task);
+        // The db authorizes, validates and applies the assignee rule itself: 404, 403, 400, then the write.
+        const outcome = db.createTask(projectId, body?.task, userId);
         switch (outcome.kind) {
           case "missing":
             return notFound("project");
+          case "forbidden":
+            return forbidden();
           case "invalid":
             return badRequest(outcome.error);
           case "created": {
@@ -142,12 +145,14 @@ export function createRoutes(ctx: RouteContext) {
      * case in the plan).
      */
     "/api/v1/projects/:id/tasks/import": {
-      POST: authed<"/api/v1/projects/:id/tasks/import">((req) => {
+      POST: authed<"/api/v1/projects/:id/tasks/import">((req, userId) => {
         const projectId = Number(req.params.id);
-        if (!db.hasProject(projectId)) return notFound("project");
         const titles = ["Imported: triage backlog", "Imported: write docs", "Imported: plan release"];
-        // report what was actually written, not what was attempted
-        const imported = titles.filter((title) => db.createTask(projectId, { title }).kind === "created").length;
+        // createTask decides existence and membership; the first outcome says which applies.
+        const outcomes = titles.map((title) => db.createTask(projectId, { title }, userId));
+        if (outcomes[0]?.kind === "missing") return notFound("project");
+        if (outcomes[0]?.kind === "forbidden") return forbidden();
+        const imported = outcomes.filter((o) => o.kind === "created").length; // what was written, not attempted
         if (imported > 0) push.broadcast({ type: "reload", objectType: "project", objectId: projectId });
         return Response.json({ imported });
       }),
@@ -160,15 +165,17 @@ export function createRoutes(ctx: RouteContext) {
         const task = db.getTask(Number(req.params.id));
         return task ? Response.json({ task: db.withAssignee(task) }) : notFound("task");
       }),
-      PUT: authed<"/api/v1/tasks/:id">(async (req) => {
+      PUT: authed<"/api/v1/tasks/:id">(async (req, userId) => {
         const id = Number(req.params.id);
         const body = await json<{ task?: unknown }>(req);
         // The db decides everything in one atomic step, in the documented order
-        // (docs/API.md): 404, 400 malformed, 409 with the current task, 400 bad values.
-        const outcome = db.updateTask(id, body?.task);
+        // (docs/API.md): 404, 403, 400 malformed, 409 with the current task, 400 bad values.
+        const outcome = db.updateTask(id, body?.task, userId);
         switch (outcome.kind) {
           case "missing":
             return notFound("task");
+          case "forbidden":
+            return forbidden();
           case "conflict":
             return Response.json({ error: "conflict", task: db.withAssignee(outcome.current) }, { status: 409 });
           case "invalid":
@@ -180,14 +187,15 @@ export function createRoutes(ctx: RouteContext) {
           }
         }
       }),
-      DELETE: authed<"/api/v1/tasks/:id">((req) => {
+      DELETE: authed<"/api/v1/tasks/:id">((req, userId) => {
         const id = Number(req.params.id);
-        const removed = db.deleteTask(id);
-        if (!removed) return notFound("task");
+        const outcome = db.deleteTask(id, userId);
+        if (outcome.kind === "missing") return notFound("task");
+        if (outcome.kind === "forbidden") return forbidden();
         push.broadcast({ type: "delete", objectType: "task", objectId: id });
         return Response.json({
-          deleted_tasks: [removed.task.id],
-          deleted_comments: removed.comments.map((c) => c.id),
+          deleted_tasks: [outcome.task.id],
+          deleted_comments: outcome.comments.map((c) => c.id),
         });
       }),
     },

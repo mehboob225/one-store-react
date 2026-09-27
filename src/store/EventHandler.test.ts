@@ -94,7 +94,14 @@ describe("eventKey", () => {
     expect(() => eventKey({ objectType: "tasks", id: undefined } as never)).toThrow(/undefined id/);
     expect(() => eventKey({ objectType: "tasks", keyName: "project_id", key: undefined } as never)).toThrow(/both keyName and key/);
     const bus = new DataEventHandler();
-    expect(() => bus.subscribe({ objectType: "tasks", id: undefined as unknown as number }, () => {})).toThrow(TypeError);
+    const reported: unknown[] = [];
+    const reporting = new DataEventHandler((error) => reported.push(error));
+    const off = reporting.subscribe({ objectType: "tasks", id: undefined as unknown as number }, () => {});
+    expect(reported).toHaveLength(1); // reported, not thrown: a render must not die for a bad param
+    expect(reported[0]).toBeInstanceOf(TypeError);
+    expect(off).toBeInstanceOf(Function);
+    expect(() => off()).not.toThrow();
+    expect(reporting.listenerCount()).toBe(0);
   });
 
   test("selectors that would never fire throw: null or non-scalar id/key, and id together with a foreign key", () => {
@@ -188,9 +195,17 @@ describe("DataEventHandler", () => {
     bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: NaN }, { id: "" }, { id: " 1" }, { id: 2 }] });
     await tick();
     expect(ids).toEqual([2]);
-    expect(() => bus.subscribe({ objectType: "tasks", id: NaN }, () => {})).toThrow(/finite number or non-empty string/);
-    expect(() => bus.subscribe({ objectType: "tasks", id: "" }, () => {})).toThrow(TypeError);
-    expect(() => bus.subscribe({ objectType: "tasks", keyName: "project_id", key: " 1" }, () => {})).toThrow(TypeError);
+    // subscribe: reported through the error handler with the selector named, never thrown (review 13, finding 4)
+    const reports: { error: unknown; key?: string }[] = [];
+    const reporting = new DataEventHandler((error, context) => reports.push({ error, ...context }));
+    reporting.subscribe({ objectType: "tasks", id: NaN }, () => {});
+    reporting.subscribe({ objectType: "tasks", id: "" }, () => {});
+    reporting.subscribe({ objectType: "tasks", keyName: "project_id", key: " 1" }, () => {});
+    expect(reports.map((r) => r.key)).toEqual(["tasks/NaN", "tasks/", "tasks/project_id/ 1"]);
+    expect(reports.every((r) => r.error instanceof TypeError)).toBe(true);
+    expect(reporting.listenerCount()).toBe(0);
+    // eventKey keeps throwing, for callers that want the exception
+    expect(() => eventKey({ objectType: "tasks", id: NaN })).toThrow(/finite number or non-empty string/);
   });
 
   test("a custom index field is honoured and objects without an index value are skipped", async () => {

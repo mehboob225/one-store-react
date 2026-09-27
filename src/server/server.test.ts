@@ -263,13 +263,19 @@ describe("projects and tasks", () => {
     expect(cleared.status).toBe(200);
   });
 
-  test("PUT /tasks/:id decides 404 → 400 malformed → 409 → 400 values, in that order, atomically (docs/API.md)", async () => {
+  test("PUT /tasks/:id decides 404 → 403 → 400 malformed → 409 → 400 values, in that order, atomically (docs/API.md)", async () => {
     const put = (id: number, task: unknown) => api(`/tasks/${id}`, { method: "PUT", body: JSON.stringify({ task }) });
     // 1. unknown task: 404 whatever the body
     for (const task of [{ hash: "x", assignee_id: 3 }, { hash: "x", status: "bogus" }, {}, "nope", null]) {
       expect((await put(999, task)).status).toBe(404);
     }
-    // 2. malformed: no task object, or no string hash — a broken request, never a conflict
+    // 2. not a member: 403 before any body check, even with a stale hash or a bad body
+    const alan = await authHeaderFor("alan@example.com");
+    for (const task of [{ hash: "stale" }, {}, { hash: "t1-1", status: "bogus" }]) {
+      expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task }) }, alan)).status).toBe(403);
+    }
+    expect((await api("/tasks/999", { method: "PUT", body: JSON.stringify({ task: {} }) }, alan)).status).toBe(404); // 404 still first
+    // 3. malformed: no task object, or no string hash — a broken request, never a conflict
     for (const [task, message] of [
       [{}, "task.hash must be a string"],
       [{ hash: 5 }, "task.hash must be a string"],
@@ -281,29 +287,32 @@ describe("projects and tasks", () => {
       expect(res.status).toBe(400);
       expect(((await res.json()) as { error: string }).error).toBe(message);
     }
-    // 3. stale hash: 409 carrying the current task, even with a bad body or assignee
+    // 4. stale hash: 409 carrying the current task, even with a bad body or assignee
     for (const task of [{ hash: "stale", assignee_id: 3 }, { hash: "stale", status: "bogus" }, { hash: "stale" }]) {
       const res = await put(1, task);
       expect(res.status).toBe(409);
       expect(((await res.json()) as { task: { id: number; hash: string } }).task).toMatchObject({ id: 1, hash: "t1-1" });
     }
-    // 4. current hash: only now are the values and the assignee checked; nothing was written so far
+    // 5. current hash: only now are the values and the assignee checked; nothing was written so far
     expect((await put(1, { hash: "t1-1", status: "bogus" })).status).toBe(400);
     expect((await put(1, { hash: "t1-1", assignee_id: 3 })).status).toBe(400);
     expect(((await (await api("/tasks/1")).json()) as { task: { hash: string } }).task.hash).toBe("t1-1");
-    // 5. and the write is atomic with the hash check: the same hash cannot be spent twice
+    // 6. and the write is atomic with the hash check: the same hash cannot be spent twice
     expect((await put(1, { hash: "t1-1", status: "done" })).status).toBe(200);
     expect((await put(1, { hash: "t1-1", status: "todo" })).status).toBe(409);
   });
 
   test("validation and the assignee rule are enforced by the data layer, not only by the routes", () => {
-    expect(mock.db.createTask(1, { title: "x", assignee_id: 3 })).toEqual({ kind: "invalid", error: expect.stringContaining("owner or a project member") });
-    expect(mock.db.createTask(1, { title: "x", assignee_id: 1 }).kind).toBe("created"); // the owner, who need not be in member_ids
-    expect(mock.db.createTask(1, "nope")).toEqual({ kind: "invalid", error: "task must be an object" });
-    expect(mock.db.createTask(1, { title: "" })).toEqual({ kind: "invalid", error: "task.title must be a non-empty string" });
-    expect(mock.db.createTask(999, { title: "x" }).kind).toBe("missing");
-    expect(mock.db.updateTask(1, { hash: "t1-1", status: "bogus" })).toMatchObject({ kind: "invalid" });
-    expect(mock.db.updateTask(1, "nope")).toEqual({ kind: "invalid", error: "task must be an object" });
+    expect(mock.db.createTask(1, { title: "x", assignee_id: 3 }, 1)).toEqual({ kind: "invalid", error: expect.stringContaining("owner or a project member") });
+    expect(mock.db.createTask(1, { title: "x", assignee_id: 1 }, 1).kind).toBe("created"); // the owner (always a member)
+    expect(mock.db.createTask(1, "nope", 1)).toEqual({ kind: "invalid", error: "task must be an object" });
+    expect(mock.db.createTask(1, { title: "" }, 1)).toEqual({ kind: "invalid", error: "task.title must be a non-empty string" });
+    expect(mock.db.createTask(999, { title: "x" }, 1).kind).toBe("missing");
+    expect(mock.db.createTask(1, { title: "x" }, 3).kind).toBe("forbidden"); // Alan is not on project 1
+    expect(mock.db.updateTask(1, { hash: "t1-1", status: "bogus" }, 1)).toMatchObject({ kind: "invalid" });
+    expect(mock.db.updateTask(1, "nope", 1)).toEqual({ kind: "invalid", error: "task must be an object" });
+    expect(mock.db.updateTask(1, { hash: "t1-1" }, 3).kind).toBe("forbidden");
+    expect(mock.db.deleteTask(1, 3).kind).toBe("forbidden");
     expect(mock.db.isProjectParticipant(1, 3)).toBe(false);
     expect(mock.db.isProjectParticipant(2, 1)).toBe(true);
   });
@@ -315,7 +324,8 @@ describe("projects and tasks", () => {
     mock.db.reset(data);
     expect(mock.db.isProjectParticipant(2, 1)).toBe(false);
 
-    const put = (task: object) => api("/tasks/5", { method: "PUT", body: JSON.stringify({ task }) });
+    const grace = await authHeaderFor("grace@example.com"); // still on project 2; Ada no longer is, so she may not write to it
+    const put = (task: object) => api("/tasks/5", { method: "PUT", body: JSON.stringify({ task }) }, grace);
     // saving the whole task back with the same assignee: fine
     let res = await put({ hash: "t5-1", title: "renamed", assignee_id: 1 });
     expect(res.status).toBe(200);
@@ -324,6 +334,31 @@ describe("projects and tasks", () => {
     expect((await put({ hash, assignee_id: 3 })).status).toBe(400);
     // re-assigning the same non-participant explicitly is not a change either
     expect((await put({ hash, assignee_id: 1, status: "done" })).status).toBe(200);
+  });
+
+  test("writes to a project's tasks require membership; reads are workspace-wide (review 13, finding 1)", async () => {
+    const alan = await authHeaderFor("alan@example.com"); // on no project
+    expect((await api("/projects/1/tasks", {}, alan)).status).toBe(200); // read: fine
+    expect((await api("/tasks/1", {}, alan)).status).toBe(200);
+    const post = await api("/projects/1/tasks", { method: "POST", body: JSON.stringify({ task: { title: "x" } }) }, alan);
+    expect(post.status).toBe(403);
+    expect(await post.json()).toEqual({ error: "not a member of this project" });
+    expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: { hash: "t1-1", title: "y" } }) }, alan)).status).toBe(403);
+    expect((await api("/tasks/1", { method: "DELETE" }, alan)).status).toBe(403);
+    expect((await api("/projects/1/tasks/import", { method: "POST" }, alan)).status).toBe(403);
+    expect((await api("/projects/999/tasks/import", { method: "POST" }, alan)).status).toBe(404); // 404 before 403
+    // nothing was written or broadcast for Alan's attempts
+    expect(((await (await api("/projects/1/tasks")).json()) as { tasks: unknown[] }).tasks).toHaveLength(3);
+    // a member may do all of it
+    expect((await api("/projects/1/tasks", { method: "POST", body: JSON.stringify({ task: { title: "x" } }) })).status).toBe(201);
+  });
+
+  test("the owner is always a member: a seed that breaks it is refused at load (review 13, finding 3)", () => {
+    const data = seed();
+    data.projects[0]!.member_ids = [2]; // owner 1 dropped
+    expect(() => mock.db.reset(data)).toThrow(/project 1 owner 1 must be in member_ids/);
+    mock.db.reset(); // back to a valid seed for the next test
+    for (const p of mock.db.listProjects()) expect(p.member_ids).toContain(p.owner_id);
   });
 
   test("the import route reports what was written and broadcasts only then (review 11 finding 2, review 12 findings 3, 7)", async () => {
@@ -337,7 +372,7 @@ describe("projects and tasks", () => {
     try {
       // one of the three creates fails: the count must say 2, not 3
       let calls = 0;
-      mock.db.createTask = (projectId, body) => (++calls === 2 ? { kind: "invalid", error: "stubbed" } : originalCreate(projectId, body));
+      mock.db.createTask = (projectId, body, actorId) => (++calls === 2 ? { kind: "invalid", error: "stubbed" } : originalCreate(projectId, body, actorId));
       let body = (await (await api("/projects/2/tasks/import", { method: "POST" })).json()) as { imported: number };
       expect(body.imported).toBe(2);
       expect(broadcasts).toEqual([{ type: "reload", objectType: "project", objectId: 2 }]);

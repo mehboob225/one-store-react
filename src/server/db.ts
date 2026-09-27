@@ -32,20 +32,23 @@ export interface NewTask {
 /** The fields a client may change on a task. `id`, `project_id` and `hash` are server-owned. */
 export type TaskFields = Partial<Omit<TaskRow, "id" | "project_id" | "hash">>;
 
-/** Outcome of `createTask`, in check order: missing → 404, invalid → 400. */
-export type CreateOutcome = { kind: "missing" } | { kind: "invalid"; error: string } | { kind: "created"; task: TaskRow };
-
 /**
- * Outcome of `updateTask`, in check order — the route maps each to a status:
- * missing → 404, conflict → 409, invalid → 400 (a malformed envelope and a
- * bad field value are both `invalid`; the docblock on `updateTask` gives the
- * order in which they are detected).
+ * Write outcomes, in check order — the route maps each to a status:
+ * missing → 404, forbidden → 403 (the actor is not on the project),
+ * conflict → 409, invalid → 400 (a malformed envelope and a bad field value
+ * are both `invalid`; each method's docblock gives the detection order).
+ * Reads are workspace-wide; WRITES REQUIRE MEMBERSHIP of the project.
  */
+export type CreateOutcome = { kind: "missing" } | { kind: "forbidden" } | { kind: "invalid"; error: string } | { kind: "created"; task: TaskRow };
+
 export type UpdateOutcome =
   | { kind: "missing" }
+  | { kind: "forbidden" }
   | { kind: "conflict"; current: TaskRow }
   | { kind: "invalid"; error: string }
   | { kind: "updated"; task: TaskRow };
+
+export type DeleteOutcome = { kind: "missing" } | { kind: "forbidden" } | { kind: "deleted"; task: TaskRow; comments: CommentRow[] };
 
 const ASSIGNEE_RULE = "task.assignee_id must be the project owner or a project member";
 
@@ -54,12 +57,14 @@ export class Database {
   private nextId: Record<keyof SeedData, number>;
 
   constructor(initial: SeedData = seed()) {
+    assertSeedInvariants(initial);
     this.data = initial;
     this.nextId = Database.idsFor(initial);
   }
 
   /** Replaces all data with a fresh seed (tests). */
   reset(initial: SeedData = seed()): void {
+    assertSeedInvariants(initial);
     this.data = initial;
     this.nextId = Database.idsFor(initial);
   }
@@ -133,14 +138,14 @@ export class Database {
   }
 
   /**
-   * Whether `userId` may be assigned work in `projectId`: the project's owner
-   * or one of its members. The owner need not appear in `member_ids`, so a
-   * project's `getMembers()` is not guaranteed to list every assignee — the
-   * owner is the one exception.
+   * Whether `userId` is on project `projectId`. Membership is the one rule for
+   * who may write to a project and who may be assigned its tasks. The owner
+   * is always a member (a seed invariant), so `member_ids` — and the client's
+   * `getMembers()` — is the complete list.
    */
   isProjectParticipant(projectId: number, userId: number): boolean {
     const project = this.data.projects.find((p) => p.id === projectId);
-    return project !== undefined && (project.owner_id === userId || project.member_ids.includes(userId));
+    return project !== undefined && isMember(project, userId);
   }
 
   hasProject(id: number): boolean {
@@ -153,20 +158,18 @@ export class Database {
 
   /**
    * Creates a task from an untrusted body, in one step: the project must
-   * exist, the body must validate, and an assignee must be an owner or
-   * member. Validation and the assignee rule live here, next to the write,
-   * so every writer (routes, imports, tests) gets them.
+   * exist, the actor must be on it, the body must validate, and an assignee
+   * must be a member. Authorization, validation and the assignee rule live
+   * here, next to the write, so every writer (routes, imports, tests) gets them.
    */
-  createTask(projectId: number, body: unknown): CreateOutcome {
-    const project = this.data.projects.find((p) => p.id === projectId); // one lookup serves both checks
+  createTask(projectId: number, body: unknown, actorId: number): CreateOutcome {
+    const project = this.data.projects.find((p) => p.id === projectId); // one lookup serves every check
     if (!project) return { kind: "missing" };
+    if (!isMember(project, actorId)) return { kind: "forbidden" };
     const validated = validateNewTask(body);
     if (!validated.ok) return { kind: "invalid", error: validated.error };
     const input: NewTask = validated.value;
-    const assignee = input.assignee_id;
-    if (assignee != null && project.owner_id !== assignee && !project.member_ids.includes(assignee)) {
-      return { kind: "invalid", error: ASSIGNEE_RULE };
-    }
+    if (input.assignee_id != null && !isMember(project, input.assignee_id)) return { kind: "invalid", error: ASSIGNEE_RULE };
     const id = this.nextId.tasks++;
     const task: TaskRow = {
       id,
@@ -185,27 +188,30 @@ export class Database {
    * Updates a task from an untrusted body in ONE synchronous step — optimistic
    * locking depends on nothing happening between the hash check and the write:
    *   1. the task must exist                                       → missing
-   *   2. the envelope: an object with a string `hash`             → invalid (400, before the hash is compared)
-   *   3. the hash must be the current one                          → conflict (with the current row)
-   *   4. the field values must validate, and a CHANGED assignee
-   *      must be an owner or member                                → invalid
-   *   5. the mutable fields are applied and the hash bumped        → updated
+   *   2. the actor must be on the task's project                   → forbidden
+   *   3. the envelope: an object with a string `hash`             → invalid (400, before the hash is compared)
+   *   4. the hash must be the current one                          → conflict (with the current row)
+   *   5. the field values must validate, and a CHANGED assignee
+   *      must be a member                                          → invalid
+   *   6. the mutable fields are applied and the hash bumped        → updated
    * `id`, `project_id` and `hash` can never be set by a caller. The assignee
    * rule applies only to a change: saving a task back with its existing
    * assignee must not fail because that user has since left the project.
    */
-  updateTask(id: number, body: unknown): UpdateOutcome {
+  updateTask(id: number, body: unknown, actorId: number): UpdateOutcome {
     const task = this.data.tasks.find((t) => t.id === id);
     if (!task) return { kind: "missing" };
+    const project = this.data.projects.find((p) => p.id === task.project_id)!; // tasks always belong to a project
+    if (!isMember(project, actorId)) return { kind: "forbidden" };
     const envelope = validateTaskEnvelope(body);
     if (!envelope.ok) return { kind: "invalid", error: envelope.error };
     if (envelope.value.hash !== task.hash) return { kind: "conflict", current: clone(task) };
 
-    const validated = validateTaskFields(body as Record<string, unknown>);
+    const validated = validateTaskFields(envelope.value.body);
     if (!validated.ok) return { kind: "invalid", error: validated.error };
     const fields = validated.value;
-    const assigneeChanged = "assignee_id" in fields && fields.assignee_id !== task.assignee_id;
-    if (assigneeChanged && fields.assignee_id != null && !this.isProjectParticipant(task.project_id, fields.assignee_id)) {
+    const assigneeChanged = Object.hasOwn(fields, "assignee_id") && fields.assignee_id !== task.assignee_id;
+    if (assigneeChanged && fields.assignee_id != null && !isMember(project, fields.assignee_id)) {
       return { kind: "invalid", error: ASSIGNEE_RULE };
     }
 
@@ -216,17 +222,19 @@ export class Database {
     return { kind: "updated", task: clone(task) };
   }
 
-  /** Removes the task and its comments + tag links. Returns what was removed. */
-  deleteTask(id: number): { task: TaskRow; comments: CommentRow[] } | undefined {
+  /** Removes the task and its comments + tag links, if the actor is on its project. */
+  deleteTask(id: number, actorId: number): DeleteOutcome {
     const index = this.data.tasks.findIndex((t) => t.id === id);
-    if (index === -1) return undefined;
-    const [task] = this.data.tasks.splice(index, 1);
+    if (index === -1) return { kind: "missing" };
+    const task = this.data.tasks[index]!;
+    if (!this.isProjectParticipant(task.project_id, actorId)) return { kind: "forbidden" };
+    this.data.tasks.splice(index, 1);
 
     const comments = this.data.comments.filter((c) => c.task_id === id);
     this.data.comments = this.data.comments.filter((c) => c.task_id !== id);
     this.data.task_tags = this.data.task_tags.filter((tt) => tt.task_id !== id);
 
-    return { task: task!, comments };
+    return { kind: "deleted", task, comments };
   }
 
   // ---- comments ----------------------------------------------------------
@@ -253,6 +261,23 @@ export class Database {
   withAssignee(task: TaskRow): TaskRow & { assignee: PublicUser | null } {
     const assignee = task.assignee_id === null ? null : (this.getUser(task.assignee_id) ?? null);
     return { ...task, assignee };
+  }
+}
+
+/** The one membership rule, on a loaded project row. */
+function isMember(project: ProjectRow, userId: number): boolean {
+  return project.member_ids.includes(userId);
+}
+
+/**
+ * Data invariants the rules above rely on. Checked whenever data is loaded so
+ * a bad seed fails at startup, not in a route.
+ */
+function assertSeedInvariants(data: SeedData): void {
+  for (const project of data.projects) {
+    if (!project.member_ids.includes(project.owner_id)) {
+      throw new Error(`seed invariant: project ${project.id} owner ${project.owner_id} must be in member_ids`);
+    }
   }
 }
 

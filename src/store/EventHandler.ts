@@ -46,7 +46,11 @@
  *    STORE ONCE AFTER SUBSCRIBING — the timestamp atoms do this on mount;
  *  - a throwing listener never stops the others;
  *  - a `flush()` requested from inside a flush runs after the current one,
- *    so batches are always delivered in the order they were queued.
+ *    so batches are always delivered in the order they were queued;
+ *  - a selector that can never fire (undefined/NaN/"" id or key, half a
+ *    foreign key) is a bug: `subscribe` reports it through the error handler
+ *    and returns a no-op unsubscribe rather than throwing mid-render;
+ *    `eventKey` throws, for tests and callers that want the exception.
  */
 
 import { canonicalKey, hasField, isKeyValue, ownField } from "./canonicalKey";
@@ -244,7 +248,17 @@ export class DataEventHandler {
   /** Subscribes to a selector (bucket, object, or foreign-key value). Each call is its own subscription. */
   subscribe(selector: DataEventSelector, listener: DataEventListener): Unsubscribe {
     // Resolved once: unsubscribe must not re-read a selector the caller may have mutated since.
-    const resolved = resolve(selector);
+    let resolved: Resolved;
+    try {
+      resolved = resolve(selector);
+    } catch (error) {
+      // A selector that can never fire (NaN or "" from an unparsed route param, half a foreign
+      // key…) is a bug, but not one worth taking a render tree down for: report it loudly through
+      // the bus's error handler and hand back a no-op unsubscribe. `eventKey` still throws, for
+      // callers that want the exception.
+      report(this.onListenerError, error, { key: describeSelector(selector) });
+      return () => {};
+    }
     const entry: Entry<DataEventBatch> = { listener };
     const target = this.targetFor(resolved, true)!;
     target.add(entry);
@@ -443,6 +457,12 @@ function getOrCreate(map: Map<string, Target>, key: string, create: boolean): Ta
     map.set(key, target);
   }
   return target;
+}
+
+/** Best-effort label for an invalid selector in an error report. */
+function describeSelector(selector: DataEventSelector): string {
+  const { objectType, id, keyName, key } = selector as { objectType: string; id?: unknown; keyName?: unknown; key?: unknown };
+  return `${objectType}${id !== undefined ? `/${String(id)}` : ""}${keyName !== undefined || key !== undefined ? `/${String(keyName)}/${String(key)}` : ""}`;
 }
 
 function indexById(objects: readonly Row[], index: string): Map<string, Row> {
