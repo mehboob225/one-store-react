@@ -7,6 +7,7 @@ import {
   PERSISTED_STATE_PREFIX,
   RETURN_URL_STORAGE_KEY,
   toCredentials,
+  type FetchLike,
   type KeyValueStorage,
 } from "./AuthenticationService";
 
@@ -255,12 +256,15 @@ describe("defaults", () => {
 });
 
 // ---------------------------------------------------------------------------
-// PR #4 review regressions
+// PR #4 review regressions (two rounds)
 // ---------------------------------------------------------------------------
 
 const STATE = PERSISTED_STATE_PREFIX;
+const ADA = { uuid: "a", token: "t", userId: 1 };
+const ADA_AGAIN = { uuid: "a2", token: "t2", userId: 1 };
+const GRACE = { uuid: "g", token: "t3", userId: 2 };
 
-/** Real sign_in responses for Ada and Grace, obtained up front so tests can replay them in any order. */
+/** Real sign_in responses, obtained up front so tests can replay them in any order. */
 async function signInResponseBody(email: string) {
   const res = await fetch(`${apiBase}v1/sign_in`, {
     method: "POST",
@@ -278,88 +282,98 @@ function controlledFetch() {
   return { fetchImpl, pending };
 }
 
-/** Simulates another tab writing to shared localStorage and the resulting storage event. */
-function otherTab(local: KeyValueStorage, listeners: ((e: Event) => void)[]) {
-  return {
-    login(credentials: { uuid: string; token: string; userId: number }) {
-      local.setItem(CREDENTIALS_STORAGE_KEY, JSON.stringify(credentials));
-      for (const l of listeners) l({ key: CREDENTIALS_STORAGE_KEY } as StorageEvent);
-    },
-    logout() {
-      local.removeItem(CREDENTIALS_STORAGE_KEY);
-      for (const l of listeners) l({ key: CREDENTIALS_STORAGE_KEY } as StorageEvent);
-    },
-  };
-}
-
-function withStorageEvents() {
+/**
+ * Two browser tabs: real service instances sharing one localStorage, each
+ * with its own sessionStorage. `sync()` delivers the `storage` event the
+ * browser would fire after a write; tests call it to control when the other
+ * tab finds out. Tabs whose credentials did not change treat it as a no-op.
+ */
+function twoTabs(shared: Record<string, string> = {}, extra: { fetch?: FetchLike } = {}) {
+  const local = memoryStorage(shared);
   const listeners: ((e: Event) => void)[] = [];
-  const eventTarget = {
-    addEventListener: (_t: string, l: EventListenerOrEventListenerObject) => void listeners.push(l as (e: Event) => void),
+  const tab = (initialSession: Record<string, string> = {}) => {
+    const session = memoryStorage(initialSession);
+    const mine: ((e: Event) => void)[] = [];
+    const eventTarget = {
+      addEventListener: (_t: string, l: EventListenerOrEventListenerObject) => {
+        mine.push(l as (e: Event) => void);
+        listeners.push(l as (e: Event) => void);
+      },
+    };
+    const auth = service({ localStorage: local, sessionStorage: session, eventTarget, ...extra });
+    return { auth, session };
   };
-  return { listeners, eventTarget };
+  const sync = () => {
+    for (const l of listeners) l({ key: CREDENTIALS_STORAGE_KEY } as StorageEvent);
+  };
+  return { local, tab, sync };
 }
 
-describe("finding 1: persisted UI state is cleared on every logout / account switch", () => {
+describe("finding 1 (round 1): persisted UI state is cleared on logout / account switch", () => {
   test("a logout in another tab clears this tab's _state_* keys but keeps the return URL", () => {
-    const local = memoryStorage({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify({ uuid: "a", token: "t", userId: 1 }), [`${STATE}draft`]: "private" });
-    const session = memoryStorage({ [`${STATE}tab`]: "tasks", [RETURN_URL_STORAGE_KEY]: "/back" });
-    const { listeners, eventTarget } = withStorageEvents();
-    const auth = service({ localStorage: local, sessionStorage: session, eventTarget });
-    expect(auth.isAuthenticated()).toBe(true);
+    const { local, tab, sync } = twoTabs({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify(ADA), [`${STATE}draft`]: "shared" });
+    const a = tab({ [`${STATE}tab`]: "tasks", [RETURN_URL_STORAGE_KEY]: "/back" });
+    const b = tab({ [`${STATE}other`]: "x" });
+    expect(a.auth.isAuthenticated()).toBe(true);
 
-    otherTab(local, listeners).logout();
-
-    expect(auth.isAuthenticated()).toBe(false);
+    b.auth.handleLogout(); // b owns the transition: removes credentials, wipes shared + its own state
     expect(local.dump()).toEqual({});
-    expect(session.dump()).toEqual({ [RETURN_URL_STORAGE_KEY]: "/back" });
+    expect(b.session.dump()).toEqual({});
+    sync(); // a observes it: wipes its own tab state only
+
+    expect(a.auth.isAuthenticated()).toBe(false);
+    expect(a.session.dump()).toEqual({ [RETURN_URL_STORAGE_KEY]: "/back" });
   });
 
-  test("an account switch in another tab clears state before subscribers hear about it, and keeps the new credentials", () => {
-    const local = memoryStorage({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify({ uuid: "a", token: "t", userId: 1 }), [`${STATE}draft`]: "ada's" });
-    const session = memoryStorage({ [`${STATE}tab`]: "tasks" });
-    const { listeners, eventTarget } = withStorageEvents();
-    const auth = service({ localStorage: local, sessionStorage: session, eventTarget });
+  test("an account switch in another tab clears this tab's state before subscribers hear, keeps the new session's data", () => {
+    const { local, tab, sync } = twoTabs({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify(ADA), [`${STATE}draft`]: "ada's" });
+    const a = tab({ [`${STATE}tab`]: "tasks" });
+    const b = tab();
     const seenAtNotify: Record<string, string>[] = [];
-    auth.subscribe(() => seenAtNotify.push({ ...local.dump(), ...session.dump() }));
+    a.auth.subscribe(() => seenAtNotify.push({ ...local.dump(), ...a.session.dump() }));
 
-    otherTab(local, listeners).login({ uuid: "g", token: "t2", userId: 2 });
+    b.auth.setCredentials(GRACE); // b wipes shared state, writes Grace
+    local.setItem(`${STATE}selectedProject`, "7"); // Grace starts working in b
+    sync();
 
-    expect(auth.getCredentials()?.userId).toBe(2);
+    expect(a.auth.getCredentials()).toEqual(GRACE);
     expect(seenAtNotify).toHaveLength(1);
-    expect(Object.keys(seenAtNotify[0]!)).toEqual([CREDENTIALS_STORAGE_KEY]); // state gone, credentials present
-    expect(JSON.parse(local.getItem(CREDENTIALS_STORAGE_KEY)!)).toEqual({ uuid: "g", token: "t2", userId: 2 });
+    expect(seenAtNotify[0]).toEqual({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify(GRACE), [`${STATE}selectedProject`]: "7" });
+    expect(a.session.dump()).toEqual({});
+    expect(local.dump()[`${STATE}draft`]).toBeUndefined();
   });
 
   test("a direct account switch via setCredentials clears state in both storages", () => {
     const local = memoryStorage({ [`${STATE}draft`]: "ada's" });
     const session = memoryStorage({ [`${STATE}tab`]: "tasks" });
     const auth = service({ localStorage: local, sessionStorage: session });
-    auth.setCredentials({ uuid: "a", token: "t", userId: 1 });
+    auth.setCredentials(ADA);
     expect(local.dump()[`${STATE}draft`]).toBe("ada's"); // login from signed-out keeps pre-login state
 
-    auth.setCredentials({ uuid: "g", token: "t2", userId: 2 });
+    auth.setCredentials(GRACE);
 
-    expect(local.dump()).toEqual({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify({ uuid: "g", token: "t2", userId: 2 }) });
+    expect(local.dump()).toEqual({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify(GRACE) });
     expect(session.dump()).toEqual({});
   });
 
-  test("the same user starting a new session (re-login in another tab) keeps state", () => {
-    const local = memoryStorage({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify({ uuid: "a1", token: "t", userId: 1 }), [`${STATE}draft`]: "ada's" });
-    const { listeners, eventTarget } = withStorageEvents();
-    const auth = service({ localStorage: local, eventTarget });
+  test("the same user starting a new session in another tab keeps state everywhere", () => {
+    const { local, tab, sync } = twoTabs({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify(ADA), [`${STATE}draft`]: "ada's" });
+    const a = tab({ [`${STATE}tab`]: "tasks" });
+    const b = tab();
 
-    otherTab(local, listeners).login({ uuid: "a2", token: "t2", userId: 1 });
+    b.auth.setCredentials(ADA_AGAIN);
+    sync();
 
-    expect(auth.authenticationHeader()).toBe("a2:t2");
+    expect(a.auth.authenticationHeader()).toBe("a2:t2");
     expect(local.dump()[`${STATE}draft`]).toBe("ada's");
+    expect(a.session.dump()).toEqual({ [`${STATE}tab`]: "tasks" });
   });
 
   test("logout() clears state synchronously, before the server round-trip", async () => {
     const local = memoryStorage({ [`${STATE}draft`]: "x" });
     const { fetchImpl, pending } = controlledFetch();
     const auth = service({ localStorage: local, fetch: fetchImpl });
-    auth.setCredentials({ uuid: "a", token: "t", userId: 1 });
+    auth.setCredentials(ADA);
 
     const done = auth.logout();
     expect(auth.isAuthenticated()).toBe(false);
@@ -371,7 +385,7 @@ describe("finding 1: persisted UI state is cleared on every logout / account swi
   });
 });
 
-describe("finding 2: stale async results never overwrite newer authentication decisions", () => {
+describe("finding 2 (round 1): stale async results never overwrite newer decisions", () => {
   test("a login that completes after handleLogout() is discarded", async () => {
     const local = memoryStorage();
     const { fetchImpl, pending } = controlledFetch();
@@ -379,17 +393,16 @@ describe("finding 2: stale async results never overwrite newer authentication de
     const ada = await signInResponseBody("ada@example.com");
 
     const login = auth.login("ada@example.com", "password");
-    auth.setCredentials({ uuid: "tmp", token: "t", userId: 1 }); // something changed meanwhile...
-    auth.handleLogout(); // ...and the user signed out
+    auth.setCredentials({ uuid: "tmp", token: "t", userId: 1 });
+    auth.handleLogout();
     pending[0]!.resolve(Response.json(ada));
 
-    const error = await failing(login);
-    expect(error.code).toBe("superseded");
+    expect((await failing(login)).code).toBe("superseded");
     expect(auth.isAuthenticated()).toBe(false);
     expect(local.dump()).toEqual({});
   });
 
-  test("an older login response does not overwrite a newer successful login", async () => {
+  test("an older login response arriving late does not overwrite a newer login", async () => {
     const { fetchImpl, pending } = controlledFetch();
     const auth = service({ fetch: fetchImpl });
     const ada = await signInResponseBody("ada@example.com");
@@ -397,46 +410,45 @@ describe("finding 2: stale async results never overwrite newer authentication de
 
     const first = auth.login("ada@example.com", "password");
     const second = auth.login("grace@example.com", "password");
-    pending[1]!.resolve(Response.json(grace)); // newer resolves first
+    pending[1]!.resolve(Response.json(grace));
     await second;
-    pending[0]!.resolve(Response.json(ada)); // older arrives late
+    pending[0]!.resolve(Response.json(ada));
 
-    const error = await failing(first);
-    expect(error.code).toBe("superseded");
+    expect((await failing(first)).code).toBe("superseded");
     expect(auth.getCredentials()).toEqual({ uuid: grace.uuid, token: grace.token, userId: 2 });
   });
 
   test("a pending logout cannot delete a newer session started in another tab", async () => {
-    const local = memoryStorage();
-    const { listeners, eventTarget } = withStorageEvents();
     const { fetchImpl, pending } = controlledFetch();
-    const auth = service({ localStorage: local, eventTarget, fetch: fetchImpl });
-    auth.setCredentials({ uuid: "a", token: "t", userId: 1 });
+    const { local, tab, sync } = twoTabs({}, { fetch: fetchImpl });
+    const a = tab();
+    const b = tab();
+    a.auth.setCredentials(ADA);
 
-    const done = auth.logout(); // local logout happens now; sign_out request is pending
-    otherTab(local, listeners).login({ uuid: "g", token: "t2", userId: 2 });
+    const done = a.auth.logout(); // local logout now; sign_out pending
+    b.auth.setCredentials(GRACE);
+    sync();
     pending[0]!.resolve(Response.json({ ok: true }));
     await done;
 
-    expect(auth.authenticationHeader()).toBe("g:t2");
-    expect(JSON.parse(local.getItem(CREDENTIALS_STORAGE_KEY)!)).toEqual({ uuid: "g", token: "t2", userId: 2 });
+    expect(a.auth.authenticationHeader()).toBe("g:t3");
+    expect(JSON.parse(local.getItem(CREDENTIALS_STORAGE_KEY)!)).toEqual(GRACE);
   });
 
   test("handleLogout() leaves another session's stored credentials alone", () => {
     const local = memoryStorage();
     const auth = service({ localStorage: local });
-    auth.setCredentials({ uuid: "a", token: "t", userId: 1 });
-    // another tab wrote newer credentials but this tab's storage event has not fired yet
-    local.setItem(CREDENTIALS_STORAGE_KEY, JSON.stringify({ uuid: "g", token: "t2", userId: 2 }));
+    auth.setCredentials(ADA);
+    local.setItem(CREDENTIALS_STORAGE_KEY, JSON.stringify(GRACE)); // other tab wrote; event not delivered yet
 
     auth.handleLogout();
 
     expect(auth.isAuthenticated()).toBe(false);
-    expect(JSON.parse(local.getItem(CREDENTIALS_STORAGE_KEY)!)).toEqual({ uuid: "g", token: "t2", userId: 2 });
+    expect(JSON.parse(local.getItem(CREDENTIALS_STORAGE_KEY)!)).toEqual(GRACE);
   });
 });
 
-describe("finding 3: malformed 2xx responses are typed server errors", () => {
+describe("finding 3 (round 1): malformed 2xx responses are typed server errors", () => {
   const cases: [string, () => Response][] = [
     ["HTML body", () => new Response("<html>captive portal</html>", { status: 200, headers: { "content-type": "text/html" } })],
     ["empty body", () => new Response("", { status: 200 })],
@@ -448,14 +460,13 @@ describe("finding 3: malformed 2xx responses are typed server errors", () => {
   for (const [name, make] of cases) {
     test(`${name} -> AuthenticationError("server") and stays signed out`, async () => {
       const auth = service({ fetch: async () => make() });
-      const error = await failing(auth.login("a", "b"));
-      expect(error.code).toBe("server");
+      expect((await failing(auth.login("a", "b"))).code).toBe("server");
       expect(auth.isAuthenticated()).toBe(false);
     });
   }
 });
 
-describe("finding 4: blank credentials are never accepted", () => {
+describe("finding 4 (round 1): blank credentials are never accepted", () => {
   test("a 200 with empty uuid or token is a server error", async () => {
     for (const body of [
       { uuid: "", token: "t", user: { id: 1 } },
@@ -463,8 +474,7 @@ describe("finding 4: blank credentials are never accepted", () => {
       { uuid: "u", token: "t", user: { id: NaN } },
     ]) {
       const auth = service({ fetch: async () => Response.json(body) });
-      const error = await failing(auth.login("a", "b"));
-      expect(error.code).toBe("server");
+      expect((await failing(auth.login("a", "b"))).code).toBe("server");
       expect(auth.isAuthenticated()).toBe(false);
       expect(auth.authenticationHeader()).toBeNull();
     }
@@ -490,5 +500,140 @@ describe("finding 4: blank credentials are never accepted", () => {
     expect(toCredentials({ uuid: "u", token: "t", userId: "1" })).toBeNull();
     expect(toCredentials(null)).toBeNull();
     expect(toCredentials("u:t")).toBeNull();
+  });
+});
+
+describe("finding 1 (round 2): an explicit logout while signed out still has effects", () => {
+  test("a login started while signed out is discarded if handleLogout() happens first", async () => {
+    const { fetchImpl, pending } = controlledFetch();
+    const auth = service({ fetch: fetchImpl });
+    const ada = await signInResponseBody("ada@example.com");
+
+    const login = auth.login("ada@example.com", "password");
+    auth.handleLogout(); // null -> null, but explicit
+    pending[0]!.resolve(Response.json(ada));
+
+    expect((await failing(login)).code).toBe("superseded");
+    expect(auth.isAuthenticated()).toBe(false);
+  });
+
+  test("the same holds for logout()", async () => {
+    const { fetchImpl, pending } = controlledFetch();
+    const auth = service({ fetch: fetchImpl });
+    const ada = await signInResponseBody("ada@example.com");
+
+    const login = auth.login("ada@example.com", "password");
+    await auth.logout(); // no header, so no request; must still invalidate
+    expect(pending).toHaveLength(1); // only the sign_in
+    pending[0]!.resolve(Response.json(ada));
+
+    expect((await failing(login)).code).toBe("superseded");
+    expect(auth.isAuthenticated()).toBe(false);
+  });
+
+  test("handleLogout() after a failed restore removes corrupt credentials and wipes state", () => {
+    const local = memoryStorage({ [CREDENTIALS_STORAGE_KEY]: "{corrupt", [`${STATE}draft`]: "x" });
+    const session = memoryStorage({ [`${STATE}tab`]: "y", [RETURN_URL_STORAGE_KEY]: "/back" });
+    const auth = service({ localStorage: local, sessionStorage: session });
+    expect(auth.isAuthenticated()).toBe(false);
+
+    auth.handleLogout();
+
+    expect(local.dump()).toEqual({});
+    expect(session.dump()).toEqual({ [RETURN_URL_STORAGE_KEY]: "/back" });
+  });
+
+  test("subscribers are still not notified for a no-op logout", () => {
+    const auth = service();
+    const events: unknown[] = [];
+    auth.subscribe((c) => events.push(c));
+    auth.handleLogout();
+    auth.handleLogout();
+    expect(events).toEqual([]);
+  });
+});
+
+describe("finding 2 (round 2): the latest login attempt wins regardless of response order", () => {
+  test("an older request resolving first is discarded in favour of the newer pending one", async () => {
+    const { fetchImpl, pending } = controlledFetch();
+    const auth = service({ fetch: fetchImpl });
+    const ada = await signInResponseBody("ada@example.com");
+    const grace = await signInResponseBody("grace@example.com");
+
+    const first = auth.login("ada@example.com", "password");
+    const second = auth.login("grace@example.com", "password");
+    pending[0]!.resolve(Response.json(ada)); // older resolves first
+    expect((await failing(first)).code).toBe("superseded");
+    expect(auth.isAuthenticated()).toBe(false); // nothing applied yet
+
+    pending[1]!.resolve(Response.json(grace));
+    await second;
+    expect(auth.getCredentials()).toEqual({ uuid: grace.uuid, token: grace.token, userId: 2 });
+  });
+
+  test("a change from another tab during a login supersedes it", async () => {
+    const { fetchImpl, pending } = controlledFetch();
+    const { tab, sync } = twoTabs({}, { fetch: fetchImpl });
+    const a = tab();
+    const b = tab();
+    const ada = await signInResponseBody("ada@example.com");
+
+    const login = a.auth.login("ada@example.com", "password");
+    b.auth.setCredentials(GRACE);
+    sync();
+    pending[0]!.resolve(Response.json(ada));
+
+    expect((await failing(login)).code).toBe("superseded");
+    expect(a.auth.getCredentials()).toEqual(GRACE);
+  });
+});
+
+describe("finding 3 (round 2): a stale logout never wipes a newer session's shared state", () => {
+  test("handleLogout() with foreign credentials in storage clears only this tab's state", () => {
+    const { local, tab, sync } = twoTabs({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify(ADA), [`${STATE}draft`]: "ada's" });
+    const a = tab({ [`${STATE}tab`]: "tasks" });
+    const b = tab();
+
+    b.auth.setCredentials(GRACE); // wipes Ada's shared state, writes Grace
+    local.setItem(`${STATE}selectedProject`, "7"); // Grace's new shared state
+    // a has not received the storage event yet, then gets a 401 for Ada's dead session:
+    a.auth.handleLogout();
+
+    expect(a.auth.isAuthenticated()).toBe(false);
+    expect(a.session.dump()).toEqual({});
+    expect(local.dump()).toEqual({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify(GRACE), [`${STATE}selectedProject`]: "7" });
+
+    sync(); // the event arrives: a becomes Grace, shared state intact
+    expect(a.auth.getCredentials()).toEqual(GRACE);
+    expect(local.dump()[`${STATE}selectedProject`]).toBe("7");
+  });
+
+  test("observing a switch from another tab never wipes shared state (the switching tab already did)", () => {
+    const { local, tab, sync } = twoTabs({ [CREDENTIALS_STORAGE_KEY]: JSON.stringify(ADA) });
+    const a = tab();
+    const b = tab();
+    b.auth.setCredentials(GRACE);
+    local.setItem(`${STATE}selectedProject`, "7");
+    local.setItem(`${STATE}filters`, "open");
+
+    sync();
+
+    expect(a.auth.getCredentials()).toEqual(GRACE);
+    expect(local.dump()).toEqual({
+      [CREDENTIALS_STORAGE_KEY]: JSON.stringify(GRACE),
+      [`${STATE}selectedProject`]: "7",
+      [`${STATE}filters`]: "open",
+    });
+  });
+
+  test("clearBrowserStorage() can be scoped", () => {
+    const local = memoryStorage({ [`${STATE}a`]: "1", keep: "2" });
+    const session = memoryStorage({ [`${STATE}b`]: "3" });
+    const auth = service({ localStorage: local, sessionStorage: session });
+    auth.clearBrowserStorage({ tab: true });
+    expect(local.dump()).toEqual({ [`${STATE}a`]: "1", keep: "2" });
+    expect(session.dump()).toEqual({});
+    auth.clearBrowserStorage();
+    expect(local.dump()).toEqual({ keep: "2" });
   });
 });

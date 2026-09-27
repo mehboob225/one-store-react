@@ -12,14 +12,20 @@
  * unavailable (private mode, blocked), the service degrades to memory-only.
  *
  * Every change goes through one `commit()` path, which:
- *   - bumps a generation counter, so an async login or logout that finishes
- *     after a newer change is discarded instead of overwriting it (the same
- *     idea as the store's generation guard);
- *   - wipes every `_state_*` key from localStorage and sessionStorage when
- *     the signed-in *user* changes or signs out — those are the persisted UI
- *     atoms (step 14), which must never leak across accounts or survive a
- *     logout, including a logout performed in another tab;
- *   - notifies subscribers after the storage is consistent.
+ *   - bumps a generation counter (also bumped when a login *starts*), so an
+ *     async login or logout that finishes after a newer change is discarded
+ *     instead of overwriting it — the same idea as the store's generation
+ *     guard, and "latest attempt wins" for overlapping logins;
+ *   - wipes `_state_*` keys — the persisted UI atoms (step 14) — when the
+ *     signed-in *user* changes or signs out. Ownership rule: per-tab
+ *     sessionStorage state is cleared by every tab that observes the
+ *     transition; shared localStorage state is cleared only by the tab that
+ *     *performs* it (writes or removes the credentials). A tab whose session
+ *     is already superseded in storage by another tab is not the owner and
+ *     must not wipe the newer session's shared state;
+ *   - notifies subscribers after the storage is consistent, and only when
+ *     the credentials actually changed. Side effects are never deduplicated:
+ *     an explicit logout while signed out still invalidates pending logins.
  */
 import { DomainConfiguration } from "../config/DomainConfiguration";
 
@@ -142,7 +148,8 @@ export class AuthenticationServiceClass {
    * (`superseded`) — that result is discarded, not applied.
    */
   async login(email: string, password: string): Promise<Credentials> {
-    const generation = this.generation;
+    // A new attempt supersedes any pending one, whatever order responses arrive in.
+    const generation = ++this.generation;
 
     let response: Response;
     try {
@@ -209,12 +216,13 @@ export class AuthenticationServiceClass {
    * `session_invalid`). Does not navigate — the app shell does that.
    */
   handleLogout(): void {
-    this.commit(null, { persist: true });
+    this.commit(null, { persist: true, force: true });
   }
 
-  /** Removes every `_state_*` key from localStorage and sessionStorage. */
-  clearBrowserStorage(): void {
-    for (const storage of [this.local, this.session]) {
+  /** Removes every `_state_*` key from localStorage and sessionStorage (or just one of them). */
+  clearBrowserStorage(scope: { shared?: boolean; tab?: boolean } = { shared: true, tab: true }): void {
+    const targets = [scope.shared ? this.local : null, scope.tab ? this.session : null];
+    for (const storage of targets) {
       if (!storage) continue;
       safe(() => {
         const doomed: string[] = [];
@@ -250,32 +258,39 @@ export class AuthenticationServiceClass {
   /**
    * The single write path. `persist: false` is for changes observed from
    * another tab, whose storage writes are already done and must not be
-   * undone here.
+   * undone here. `force` runs the side effects even when nothing changed
+   * (explicit logout while signed out).
    */
-  private commit(next: Credentials | null, { persist }: { persist: boolean }): void {
+  private commit(next: Credentials | null, { persist, force = false }: { persist: boolean; force?: boolean }): void {
     const prev = this.credentials;
-    if (prev?.uuid === next?.uuid && prev?.token === next?.token && prev?.userId === next?.userId) return;
+    const unchanged = sameCredentials(prev, next);
+    if (unchanged && !force) return;
 
     this.generation++;
 
+    // Do we own the shared (localStorage) state? Only the tab performing the
+    // transition does — and not if storage already holds a different session,
+    // which means another tab performed a newer transition and owns it.
+    let ownsShared = persist;
     if (persist) {
       if (next) {
         safe(() => this.local?.setItem(CREDENTIALS_STORAGE_KEY, JSON.stringify(next)));
-      } else if (prev) {
-        // Only remove what we own: another tab may already have stored a newer session.
-        safe(() => {
-          const stored = this.readStoredCredentials();
-          if (!stored || stored.uuid === prev.uuid) this.local?.removeItem(CREDENTIALS_STORAGE_KEY);
-        });
+      } else {
+        const stored = this.readStoredCredentials(); // null when absent or corrupt
+        const foreign = stored !== null && stored.uuid !== prev?.uuid;
+        if (foreign) ownsShared = false;
+        else safe(() => this.local?.removeItem(CREDENTIALS_STORAGE_KEY)); // ours, or corrupt: remove
       }
     }
 
-    // Signed out, or a different user signed in: persisted UI state must go.
-    const userChanged = prev !== null && prev.userId !== next?.userId;
-    if (userChanged) this.clearBrowserStorage();
+    // Signed out (or explicitly logging out), or a different user signed in:
+    // persisted UI state must go — this tab's always, the shared one only if we own it.
+    const signedOut = next === null && (prev !== null || force);
+    const userChanged = prev !== null && next !== null && prev.userId !== next.userId;
+    if (signedOut || userChanged) this.clearBrowserStorage({ tab: true, shared: ownsShared });
 
     this.credentials = next;
-    for (const listener of this.listeners) listener(next);
+    if (!unchanged) for (const listener of this.listeners) listener(next);
   }
 
   private readStoredCredentials(): Credentials | null {
@@ -286,6 +301,11 @@ export class AuthenticationServiceClass {
       }) ?? null
     );
   }
+}
+
+function sameCredentials(a: Credentials | null, b: Credentials | null): boolean {
+  if (a === null || b === null) return a === b;
+  return a.uuid === b.uuid && a.token === b.token && a.userId === b.userId;
 }
 
 function isNonBlankString(value: unknown): value is string {
