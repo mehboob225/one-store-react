@@ -49,6 +49,8 @@
  *    so batches are always delivered in the order they were queued.
  */
 
+import { canonicalKey } from "./canonicalKey";
+
 export type Unsubscribe = () => void;
 
 /** Called when a listener throws; the other listeners still run. */
@@ -193,12 +195,13 @@ function resolve(selector: DataEventSelector): Resolved {
     if (typeof keyName !== "string" || !isIndexValue(key)) {
       throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key (a string or number)`);
     }
-    const value = String(key);
+    const value = canonicalKey(key);
     return { kind: "fk", objectType, keyName, value, label: `${objectType}/${keyName}/${value}` };
   }
   if (hasId) {
     if (!isIndexValue(id)) throw new TypeError(`eventKey: selector for "${objectType}" needs a string or number id`);
-    return { kind: "id", objectType, id: String(id), label: `${objectType}/${String(id)}` };
+    const canon = canonicalKey(id);
+    return { kind: "id", objectType, id: canon, label: `${objectType}/${canon}` };
   }
   if ("id" in selector || "key" in selector || "keyName" in selector) {
     throw new TypeError(`eventKey: selector for "${objectType}" has an undefined id or key; use { objectType } for the bucket`);
@@ -270,7 +273,7 @@ export class DataEventHandler {
     for (const object of objects) {
       const id = object[index];
       if (!isIndexValue(id)) continue;
-      const canon = String(id);
+      const canon = canonicalKey(id);
 
       if (type.bucket.size > 0) this.enqueue(type.bucket, objectType, objectType, id);
 
@@ -374,7 +377,7 @@ export class DataEventHandler {
 
     // Only a field present in the write can have moved the object out of its old bucket.
     const old = present ? before?.[fk] : undefined;
-    if (isIndexValue(old) && (!isIndexValue(current) || String(old) !== String(current))) {
+    if (isIndexValue(old) && (!isIndexValue(current) || canonicalKey(old) !== canonicalKey(current))) {
       this.enqueueForeignValue(values, objectType, fk, old, id);
     }
   }
@@ -382,8 +385,9 @@ export class DataEventHandler {
   /** Queues `id` for the subscribers of `fk = value`, if `value` is a scalar somebody watches. */
   private enqueueForeignValue(values: Map<string, Target>, objectType: string, fk: string, value: unknown, id: IndexValue): void {
     if (!isIndexValue(value)) return;
-    const target = values.get(String(value));
-    if (target) this.enqueue(target, `${objectType}/${fk}/${String(value)}`, objectType, id);
+    const canon = canonicalKey(value);
+    const target = values.get(canon);
+    if (target) this.enqueue(target, `${objectType}/${fk}/${canon}`, objectType, id);
   }
 
   /** Adds `id` to the target's pending batch and makes sure a flush is scheduled. */
@@ -393,7 +397,7 @@ export class DataEventHandler {
       entry = { key, objectType, ids: new Map() };
       this.pending.set(target, entry);
     }
-    const canon = String(id);
+    const canon = canonicalKey(id);
     if (!entry.ids.has(canon)) entry.ids.set(canon, id);
     this.scheduleFlush();
   }
@@ -444,7 +448,7 @@ function indexById(objects: readonly Row[], index: string): Map<string, Row> {
   const map = new Map<string, Row>();
   for (const object of objects) {
     const id = object[index];
-    if (isIndexValue(id)) map.set(String(id), object);
+    if (isIndexValue(id)) map.set(canonicalKey(id), object);
   }
   return map;
 }

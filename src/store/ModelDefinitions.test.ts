@@ -13,6 +13,7 @@ import {
   isObjectType,
   objectTypes,
   validateModelDefinitions,
+  type ForeignKeyDefinition,
   type ModelDefinition,
   type ObjectType,
 } from "./ModelDefinitions";
@@ -165,7 +166,7 @@ describe("validateModelDefinitions", () => {
       withDefs({
         users: { index: "id", model: "UserModel", relatedObjectType: { "my tasks": { objectType: "taskz", key: "owner_id", getter: "getTasks" } } },
       }),
-    ).toEqual(["users: relatedObjectType.my tasks: relation name is not a valid identifier or is reserved", 'users: relatedObjectType.my tasks.objectType "taskz" is not a known type']);
+    ).toEqual(['users: relatedObjectType.my tasks relation name "my tasks" is not a valid identifier', 'users: relatedObjectType.my tasks.objectType "taskz" is not a known type']);
   });
 
   test("hasMany requires the join bucket to declare both keys, pointing at the right types, and belongsTo", () => {
@@ -220,7 +221,7 @@ describe("validateModelDefinitions", () => {
       }),
     ).toEqual([
       'tasks: model "UserModel" is also used by users',
-      'tasks: getter "getProject" is declared by both foreignKeys.project_id and foreignKeys.owner_id',
+      'tasks: member "getProject" is declared by both foreignKeys.project_id and foreignKeys.owner_id',
       'tasks: foreignKeysArray.watcher_ids getter "get-watchers" is not a valid identifier',
     ]);
   });
@@ -293,10 +294,10 @@ describe("validateModelDefinitions", () => {
     expect(validateModelDefinitions({ "bad-name": { index: "", metaData: ["ok", "not ok"] } })).toEqual([
       '"bad-name" is not a valid object type name',
       "bad-name: index must be a non-empty field name",
-      'bad-name: metaData key "not ok" is not a valid identifier',
+      'bad-name: metaData key "not ok" is not a valid identifier or is reserved',
     ]);
-    expect(validateModelDefinitions({ things: { index: "task-id" } })).toEqual(['things: index "task-id" is not a valid identifier']);
-    expect(validateModelDefinitions({ things: { index: "my id" } })).toEqual(['things: index "my id" is not a valid identifier']);
+    expect(validateModelDefinitions({ things: { index: "task-id" } })).toEqual(['things: index "task-id" is not a valid identifier or is reserved']);
+    expect(validateModelDefinitions({ things: { index: "my id" } })).toEqual(['things: index "my id" is not a valid identifier or is reserved']);
   });
 
   test("fields named like Object.prototype members are looked up as own properties, and rejected as reserved (review 2 finding 5, review 3 finding 2)", () => {
@@ -351,6 +352,7 @@ describe("validateModelDefinitions", () => {
     }
     expect(withDefs({ things: { index: "id", foreignKeys: { x: { objectType: "users", getter: "id" } } } })).toEqual([
       'things: foreignKeys.x getter "id" is a reserved name',
+      'things: foreignKeys.x getter "id" collides with the data field declared by index',
     ]);
     // "id" is fine as a FIELD name (it is the usual index, and a 1:1 FK on the index is legal)
     expect(withDefs({ things: { index: "id", foreignKeys: { id: { objectType: "users", getter: "getUser" } } } })).toEqual([]);
@@ -369,6 +371,78 @@ describe("validateModelDefinitions", () => {
     expect(withDefs({ things: { index: "id", foreignKeys } })).toEqual([
       'things: foreignKeys has a non-plain prototype (a "__proto__" key in the literal?) — that entry was silently dropped',
     ]);
+  });
+
+  test("the index name, type names and metaData keys go through the reserved check (review 4, findings 1, 4)", () => {
+    for (const index of ["clone", "constructor", "__proto__", "toString"]) {
+      expect(validateModelDefinitions({ things: { index } })).toEqual([`things: index "${index}" is not a valid identifier or is reserved`]);
+    }
+    expect(validateModelDefinitions({ things: { index: "id" } })).toEqual([]); // "id" is fine as a field
+    for (const type of ["constructor", "hasOwnProperty", "__proto__x".replace("x", ""), "id", "generation", "reset"]) {
+      expect(validateModelDefinitions({ [type]: { index: "id" } })).toEqual([`"${type}" is a reserved object type name`]);
+    }
+    expect(validateModelDefinitions({ things: { index: "id", metaData: ["__proto__", "ok"] } })).toEqual([
+      'things: metaData key "__proto__" is not a valid identifier or is reserved',
+    ]);
+  });
+
+  test("relation names use the member tier: `id` is refused (review 4, finding 2)", () => {
+    expect(
+      withDefs({
+        tasks: { index: "id", foreignKeys: { owner_id: { objectType: "users", getter: "getOwner" } } },
+        users: { index: "id", model: "UserModel", relatedObjectType: { id: { objectType: "tasks", key: "owner_id", getter: "getTasks" } } },
+      }),
+    ).toEqual(['users: relatedObjectType.id relation name "id" is a reserved name', 'users: relatedObjectType.id relation name "id" collides with the data field declared by index']);
+  });
+
+  test("getters may not collide with data fields, and relation names are unique across relatedObjectType and hasMany (review 4, finding 3)", () => {
+    expect(
+      withDefs({
+        tasks: {
+          index: "id",
+          foreignKeys: { assignee_id: { objectType: "users", getter: "assignee" } },
+          embeddedObject: { assignee: "users" }, // declared AFTER the getter: still caught
+        },
+      }),
+    ).toEqual(['tasks: foreignKeys.assignee_id getter "assignee" collides with the data field declared by embeddedObject.assignee']);
+    expect(
+      withDefs({
+        tasks: { index: "id", foreignKeys: { project_id: { objectType: "projects", getter: "id" } } },
+      }),
+    ).toEqual(['tasks: foreignKeys.project_id getter "id" is a reserved name', 'tasks: foreignKeys.project_id getter "id" collides with the data field declared by index']);
+    expect(
+      withDefs({
+        tags: { index: "id", model: "TagModel", foreignKeys: { task_id: { objectType: "tasks", getter: "getTask" } } },
+        joins: { index: "id", foreignKeys: { task_id: { objectType: "tasks", getter: "getTask" }, tag_id: { objectType: "tags", getter: "getTag" } }, belongsTo: ["tasks"] },
+        tasks: {
+          index: "id",
+          relatedObjectType: { tags: { objectType: "tags", key: "task_id", getter: "getTagRows" } },
+          hasMany: { tags: { objectType: "tags", through: "joins", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } },
+        },
+      }),
+    ).toEqual(['tasks: member "tags" is declared by both relatedObjectType.tags and hasMany.tags']);
+  });
+
+  test("null-prototype maps are plain; the top-level map and each definition are checked too (review 4, finding 5)", () => {
+    const foreignKeys = Object.assign(Object.create(null) as Record<string, ForeignKeyDefinition>, { owner_id: { objectType: "users", getter: "getOwner" } });
+    expect(withDefs({ things: { index: "id", foreignKeys } })).toEqual([]);
+
+    const top = { __proto__: { ghosts: { index: "id" } }, users: { index: "id", model: "UserModel" } } as unknown as Record<string, ModelDefinition>;
+    expect(validateModelDefinitions(top)).toEqual([
+      'the definitions map has a non-plain prototype (a "__proto__" key in the literal?) — that entry was silently dropped',
+    ]);
+
+    const def = { index: "id", __proto__: { foreignKeys: { x: { objectType: "nope", getter: "getX" } } } } as unknown as ModelDefinition;
+    expect(validateModelDefinitions({ things: def }).filter((m) => m.includes("non-plain"))).toEqual([
+      'things: definition has a non-plain prototype (a "__proto__" key in the literal?) — that entry was silently dropped',
+    ]);
+  });
+
+  test("model names that are globals in this environment are refused, not just a static list (review 4, finding 7)", () => {
+    for (const model of ["Response", "URL", "Uint8Array", "globalThis", "Intl"]) {
+      expect(withDefs({ things: { index: "id", model } })).toEqual([`things: model "${model}" is a reserved name`]);
+    }
+    expect(withDefs({ things: { index: "id", model: "ThingModel" } })).toEqual([]);
   });
 
   test("the index may not be declared as an array foreign key (review 3, finding 1)", () => {
@@ -401,9 +475,9 @@ describe("validateModelDefinitions", () => {
 });
 
 describe("foreign-key values", () => {
-  test("single keys: non-empty strings, finite numbers and null pass; NaN, Infinity, \"\" and non-scalars fail (review findings 2, 3)", () => {
-    for (const ok of [1, 0, -5, "1", "abc", null, undefined]) expect(isForeignKeyValue(ok)).toBe(true);
-    for (const bad of [NaN, Infinity, -Infinity, "", true, false, {}, { id: 1 }, [1], 1n]) expect(isForeignKeyValue(bad)).toBe(false);
+  test("single keys: non-empty strings, finite numbers and null pass; NaN, Infinity, \"\", padded strings and non-scalars fail (review findings 2, 3; review 4 finding 9)", () => {
+    for (const ok of [1, 0, -5, -0, 1.5, "1", "1.0", "abc", "a b", null, undefined]) expect(isForeignKeyValue(ok)).toBe(true);
+    for (const bad of [NaN, Infinity, -Infinity, "", " 1", "1 ", "\t1", true, false, {}, { id: 1 }, [1], 1n]) expect(isForeignKeyValue(bad)).toBe(false);
   });
 
   test("array keys: arrays of non-null scalars pass; anything else fails, including sparse arrays (review 3, finding 5)", () => {
@@ -417,16 +491,22 @@ describe("foreign-key values", () => {
     expect(isForeignKeyArrayValue(grown)).toBe(false);
   });
 
-  test("a bad index that is also a foreign key is reported once (review 3, finding 10)", () => {
-    // task_tags_relation.id is not an FK, so build the shape on a scratch map is not possible via the
-    // real-map guard; instead prove the dedupe with a record whose index is also a declared FK name.
-    // current_users has no FKs; use tasks with a record where a declared FK is also the index? Not
-    // expressible without a schema — so assert on the Set semantics directly:
+  test("a bad index that is also a 1:1 foreign key is reported once (review 3 finding 10, review 4 finding 6)", () => {
+    const defs: Record<string, ModelDefinition> = {
+      users: { index: "id", model: "UserModel" },
+      profiles: { index: "id", foreignKeys: { id: { objectType: "users", getter: "getUser" } } },
+    };
+    expect(validateModelDefinitions(defs)).toEqual([]);
+    expect(invalidForeignKeyFields("profiles", { id: NaN }, defs)).toEqual(["id"]);
+    expect(invalidForeignKeyFields("profiles", { id: 1 }, defs)).toEqual([]);
+    expect(() => invalidForeignKeyFields("nope", { id: 1 }, defs)).toThrow(/unknown object type/);
+    // and the real-map path still dedupes
     expect(invalidForeignKeyFields("tasks", { id: NaN, project_id: NaN })).toEqual(["id", "project_id"]);
-    expect(() => assertForeignKeyValues("tasks", { id: NaN, project_id: NaN })).toThrow(/: id, project_id \(/);
   });
 
-  test("canonicalKey is the one string form for map keys (review 3, finding 4)", () => {
+  test("canonicalKey is the one string form for map keys, shared with the event bus (review 3 finding 4, review 4 finding 8)", async () => {
+    const shared = await import("./canonicalKey");
+    expect(shared.canonicalKey).toBe(canonicalKey);
     expect(canonicalKey(1)).toBe("1");
     expect(canonicalKey("1")).toBe("1");
     expect(canonicalKey("7-3")).toBe("7-3");

@@ -12,7 +12,11 @@
  *   tasks            project_id, assignee_id, embedded assignee, comments, tags
  *                    (deleting a task also deletes its comments and tag links)
  *   comments         plain rows (no model class)
- *   tags + task_tags many-to-many
+ *   tags + task_tags many-to-many. The server table is `task_tags`; the client
+ *                    bucket is `task_tags_relation`, whose rows the client
+ *                    synthesises from GET /tasks/:id/tags and removes itself
+ *                    by cascade when a task or tag is deleted (the server never
+ *                    sends `deleted_task_tags*`).
  */
 
 export type TaskStatus = "todo" | "doing" | "done";
