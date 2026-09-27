@@ -42,7 +42,7 @@ export function createMockServer(options: MockServerOptions = {}): MockServer {
         const upgraded = server.upgrade(req, { data: { userId: null } });
         return upgraded ? undefined : new Response("upgrade failed", { status: 400 });
       },
-      ...(options.routes ?? {}),
+      ...options.routes,
     },
     fetch() {
       return new Response("not found", { status: 404 });

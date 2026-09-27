@@ -33,11 +33,11 @@ export interface PushHubOptions {
 }
 
 export class PushHub {
-  private clients = new Set<Socket>();
-  private timer: ReturnType<typeof setInterval> | undefined;
+  private readonly clients = new Set<Socket>();
+  private readonly timer: ReturnType<typeof setInterval>;
 
   constructor(
-    private sessions: Sessions,
+    private readonly sessions: Sessions,
     options: PushHubOptions = {},
   ) {
     const interval = options.pingIntervalMs ?? 25_000;
@@ -55,7 +55,7 @@ export class PushHub {
   }
 
   stop(): void {
-    if (this.timer) clearInterval(this.timer);
+    clearInterval(this.timer);
     for (const ws of this.clients) ws.close(1001, "server stopping");
     this.clients.clear();
   }

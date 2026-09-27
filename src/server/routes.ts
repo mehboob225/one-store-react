@@ -22,6 +22,17 @@ export interface RouteContext {
 
 type Handler<P extends string> = (req: BunRequest<P>) => Response | Promise<Response>;
 
+const notFound = (what: string) => Response.json({ error: `${what} not found` }, { status: 404 });
+const badRequest = (message: string) => Response.json({ error: message }, { status: 400 });
+
+async function json<T>(req: Request): Promise<T | undefined> {
+  try {
+    return (await req.json()) as T;
+  } catch {
+    return undefined;
+  }
+}
+
 export function createRoutes(ctx: RouteContext) {
   const { db, sessions, push } = ctx;
 
@@ -34,17 +45,6 @@ export function createRoutes(ctx: RouteContext) {
       if (!session) return unauthorized();
       return handler(req, session.userId);
     };
-  }
-
-  const notFound = (what: string) => Response.json({ error: `${what} not found` }, { status: 404 });
-  const badRequest = (message: string) => Response.json({ error: message }, { status: 400 });
-
-  async function json<T>(req: Request): Promise<T | undefined> {
-    try {
-      return (await req.json()) as T;
-    } catch {
-      return undefined;
-    }
   }
 
   return {

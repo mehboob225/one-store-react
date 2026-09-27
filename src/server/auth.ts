@@ -13,13 +13,13 @@ export interface Session {
 }
 
 export class Sessions {
-  private byUuid = new Map<string, Session>();
+  private readonly byUuid = new Map<string, Session>();
 
-  constructor(private db: Database) {}
+  constructor(private readonly db: Database) {}
 
   signIn(email: string, password: string): { session: Session; user: PublicUser } | undefined {
     const user = this.db.findUserByEmail(email);
-    if (!user || user.password !== password) return undefined;
+    if (user?.password !== password) return undefined;
 
     const session: Session = {
       uuid: crypto.randomUUID(),
@@ -34,7 +34,7 @@ export class Sessions {
   verify(uuid: string | undefined, token: string | undefined): Session | undefined {
     if (!uuid || !token) return undefined;
     const session = this.byUuid.get(uuid);
-    return session && session.token === token ? session : undefined;
+    return session?.token === token ? session : undefined;
   }
 
   /** Parses the Authorization header and verifies it. */
