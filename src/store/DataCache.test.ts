@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { PassiveModel } from "../models/generator/PassiveModel";
+import { PassiveModel, storeOf } from "../models/generator/PassiveModel";
 import { CurrentUserModelAppData } from "../models/appdata/CurrentUserModelAppData";
 import { ProjectModelAppData } from "../models/appdata/ProjectModelAppData";
 import { TagModelAppData } from "../models/appdata/TagModelAppData";
@@ -8,7 +8,6 @@ import { UserModelAppData } from "../models/appdata/UserModelAppData";
 import { AppDataFactory } from "./AppDataFactory";
 import { DataCache } from "./DataCache";
 import { objectTypes, validateModelDefinitions } from "./ModelDefinitions";
-import { PassiveModel as PassiveModelAgain, storeOf } from "../models/generator/PassiveModel";
 
 describe("DataCache", () => {
   test("has one typed bucket per definition, in definition order, reachable by name too", () => {
@@ -172,13 +171,12 @@ describe("PassiveModel", () => {
   }
 
   test("a JSON field that would shadow a member, or an own __proto__, throws instead of being copied (step 8 review, finding 2)", () => {
-    for (const json of [JSON.parse('{"id":1,"__proto__":{}}'), { id: 1, then: 1 }, { id: 1, toJSON: 1 }, { id: 1, clone: 1 }, { id: 1, shout: "x" }, { id: 1, constructor: 1 }, { id: 1, toString: 1 }]) {
+    for (const json of [JSON.parse('{"id":1,"__proto__":{}}'), { id: 1, then: 1 }, { id: 1, toJSON: 1 }, { id: 1, clone: 1 }, { id: 1, shout: "x" }, { id: 1, constructor: 1 }, { id: 1, prototype: 1 }, { id: 1, toString: 1 }]) {
       expect(() => new Thing(json as Record<string, unknown>)).toThrow(/JSON field ".*" would shadow a model member/);
     }
     const task = new TaskModelAppData({ id: 1 });
     expect(() => task.initializeFromJson({ getProject: null })).toThrow(/"getProject" would shadow/);
     expect(new Thing({ id: 1, name: "a" })).toBeInstanceOf(Thing); // and a good payload keeps its prototype
-    expect(PassiveModelAgain).toBe(PassiveModel);
   });
 
   test("the constructor copies the JSON and `declare`d fields keep their values", () => {

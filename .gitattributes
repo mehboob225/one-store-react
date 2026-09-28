@@ -1,0 +1,3 @@
+# Generated files are compared byte for byte by `bun run generate-models --check`, so every
+# checkout must use LF; this keeps Windows clones from turning them into CRLF (and stale).
+* text=auto eol=lf

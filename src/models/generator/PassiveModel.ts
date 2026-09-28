@@ -41,7 +41,8 @@ export abstract class PassiveModel<S extends object = object> {
     const prototype = Object.getPrototypeOf(this) as object;
     const own = this as unknown as Record<string, unknown>;
     for (const key of Object.keys(json)) {
-      if (key === "__proto__" || key in prototype || isInstanceBehaviourName(key)) {
+      // `prototype` cannot hurt an instance, but it is on the validator's reserved list, so the runtime rule matches exactly
+      if (key === "__proto__" || key === "prototype" || key in prototype || isInstanceBehaviourName(key)) {
         throw new TypeError(`${this.constructor.name}: JSON field "${key}" would shadow a model member; it cannot be a data field`);
       }
       own[key] = json[key];
