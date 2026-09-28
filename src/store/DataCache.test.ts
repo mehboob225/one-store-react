@@ -7,7 +7,8 @@ import { TaskModelAppData } from "../models/appdata/TaskModelAppData";
 import { UserModelAppData } from "../models/appdata/UserModelAppData";
 import { AppDataFactory } from "./AppDataFactory";
 import { DataCache } from "./DataCache";
-import { objectTypes } from "./ModelDefinitions";
+import { objectTypes, validateModelDefinitions } from "./ModelDefinitions";
+import { PassiveModel as PassiveModelAgain, storeOf } from "../models/generator/PassiveModel";
 
 describe("DataCache", () => {
   test("has one typed bucket per definition, in definition order, reachable by name too", () => {
@@ -60,7 +61,7 @@ describe("DataCache", () => {
 
   test("a listener error handler reaches both buses", () => {
     const errors: unknown[] = [];
-    const cache = new DataCache(undefined, (error) => errors.push(error));
+    const cache = new DataCache((error) => errors.push(error));
     cache.updatedHandler.subscribe(() => {
       throw new Error("updated listener");
     });
@@ -120,9 +121,44 @@ describe("AppDataFactory and the generated accessors", () => {
   test("a metaData key is a getter on the model", () => {
     AppDataFactory.current_users.add([new CurrentUserModelAppData({ id: 1, name: "Ada" })]);
     const me = AppDataFactory.current_users.getById(1)!;
-    expect(me.subscription).toBeUndefined();
+    expect(me.getSubscription()).toBeUndefined();
     AppDataFactory.current_users.addMetaData(1, "subscription", { plan: "pro" });
-    expect(me.subscription).toEqual({ plan: "pro" });
+    expect(me.getSubscription()).toEqual({ plan: "pro" });
+    // the same name arriving inline in the JSON is an ordinary data field, not a collision (step 8 review, finding 1)
+    const inline = new CurrentUserModelAppData({ id: 2, subscription: { plan: "free" } });
+    expect((inline as unknown as { subscription: unknown }).subscription).toEqual({ plan: "free" });
+    AppDataFactory.current_users.add([inline]);
+    expect(inline.getSubscription()).toBeUndefined(); // side data is only what addMetaData attached
+  });
+
+  test("accessors resolve through the store that holds the model, not the singleton (step 8 review, finding 6)", () => {
+    const own = new DataCache();
+    const task = new TaskModelAppData({ id: 1, project_id: 1 });
+    expect(() => task.getProject()).toThrow(/not held by a store/); // never added anywhere
+    own.projects.add([new ProjectModelAppData({ id: 1, owner_id: 1 })]);
+    own.tasks.add([task]);
+    AppDataFactory.projects.add([new ProjectModelAppData({ id: 1, owner_id: 9 })]); // a different project 1 in the singleton
+    expect(task.getProject()).toBe(own.projects.getById(1));
+    expect(task.getProject()?.owner_id).toBe(1);
+    expect(storeOf(task)).toBe(own);
+    // a clone stays with the store; the slot is invisible to JSON, spreads and equality
+    const copy = task.clone();
+    expect(copy.getProject()).toBe(own.projects.getById(1));
+    expect(Object.keys(copy)).toEqual(["id", "project_id"]);
+    expect(JSON.stringify(copy)).toBe('{"id":1,"project_id":1}');
+    expect(copy).toEqual(task);
+    // plain rows are not stamped
+    own.comments.add([{ id: 1, task_id: 1 }]);
+    expect(Object.getOwnPropertySymbols(own.comments.getById(1)!)).toEqual([]);
+  });
+
+  test("every DataCache member is a reserved bucket name (step 8 review, finding 3)", () => {
+    const cache = new DataCache();
+    const members = [...Object.getOwnPropertyNames(DataCache.prototype), ...Object.keys(cache)].filter((m) => m !== "constructor" && !objectTypes.includes(m as never));
+    expect(members.sort()).toEqual(["bucket", "buckets", "eventsHandler", "generation", "objectTypes", "reset", "updatedHandler"]);
+    for (const name of members) {
+      expect(validateModelDefinitions({ [name]: { index: "id" } })).toContainEqual(`"${name}" is a reserved object type name`);
+    }
   });
 });
 
@@ -134,6 +170,16 @@ describe("PassiveModel", () => {
       return `${this.name ?? "?"}!`;
     }
   }
+
+  test("a JSON field that would shadow a member, or an own __proto__, throws instead of being copied (step 8 review, finding 2)", () => {
+    for (const json of [JSON.parse('{"id":1,"__proto__":{}}'), { id: 1, then: 1 }, { id: 1, toJSON: 1 }, { id: 1, clone: 1 }, { id: 1, shout: "x" }, { id: 1, constructor: 1 }, { id: 1, toString: 1 }]) {
+      expect(() => new Thing(json as Record<string, unknown>)).toThrow(/JSON field ".*" would shadow a model member/);
+    }
+    const task = new TaskModelAppData({ id: 1 });
+    expect(() => task.initializeFromJson({ getProject: null })).toThrow(/"getProject" would shadow/);
+    expect(new Thing({ id: 1, name: "a" })).toBeInstanceOf(Thing); // and a good payload keeps its prototype
+    expect(PassiveModelAgain).toBe(PassiveModel);
+  });
 
   test("the constructor copies the JSON and `declare`d fields keep their values", () => {
     const thing = new Thing({ id: 1, name: "a", extra: true });

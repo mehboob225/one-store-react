@@ -17,6 +17,9 @@ import {
   type ModelDefinition,
   type ObjectType,
   type RelatedObjectTypeDefinition,
+  metaDataGetterName,
+  pascalCase,
+  recordTypeName,
 } from "./ModelDefinitions";
 import { canonicalKey, isKeyValue, isRecord } from "./canonicalKey";
 
@@ -606,19 +609,29 @@ describe("validateModelDefinitions", () => {
     ]);
   });
 
-  test("metaData keys are members too: they may not collide with fields or getters (review 10, finding 9)", () => {
+  test("a metaData key gets a getX() accessor, which is a member; the key itself may not be a data field (review 10 finding 9, step 8 review finding 1)", () => {
     expect(
       withDefs({
-        things: { index: "id", foreignKeys: { owner_id: { objectType: "users", getter: "getOwner" } }, metaData: ["getOwner", "owner_id", "limits"] },
+        things: { index: "id", foreignKeys: { owner_id: { objectType: "users", getter: "getOwner" } }, metaData: ["owner", "owner_id", "limits"] },
       }),
     ).toEqual([
-      'things: member "getOwner" is declared by both foreignKeys.owner_id and metaData.getOwner',
-      'things: metaData.owner_id key "owner_id" collides with the data field declared by foreignKeys.owner_id',
+      'things: member "getOwner" is declared by both foreignKeys.owner_id and metaData.owner',
+      'things: metaData key "owner_id" is also the data field declared by foreignKeys.owner_id',
     ]);
-    expect(withDefs({ things: { index: "id", metaData: ["id"] } })).toEqual([
-      'things: metaData.id key "id" is a reserved name',
-      'things: metaData.id key "id" collides with the data field declared by index',
-    ]);
+    expect(withDefs({ things: { index: "id", metaData: ["id"] } })).toEqual(['things: metaData key "id" is also the data field declared by index']);
+    // the accessor name, not the key, is what must be a valid member: a key named like another getter is fine
+    expect(withDefs({ things: { index: "id", foreignKeys: { owner_id: { objectType: "users", getter: "getOwner" } }, metaData: ["getOwner"] } })).toEqual([]);
+    expect(metaDataGetterName("subscription_limits")).toBe("getSubscriptionLimits");
+  });
+
+  test("generated record names must be derivable and unique, or TypeScript would merge the interfaces (step 8 review, finding 5)", () => {
+    expect(withDefs({ task_tags: { index: "id" }, taskTags: { index: "id" } })).toEqual(['taskTags: generated record name "TaskTagsRecord" is also generated for "task_tags"']);
+    expect(withDefs({ comments: { index: "id" }, Comments: { index: "id" } })).toEqual(['Comments: generated record name "CommentsRecord" is also generated for "comments"']);
+    expect(withDefs({ _: { index: "id" } })).toEqual(["_: no generated record name can be derived (the name has no letters or digits)"]);
+    // model classes are named by `model`, so two such types never collide on a record name
+    expect(withDefs({ task_tags: { index: "id", model: "LinkModel" }, taskTags: { index: "id" } })).toEqual([]);
+    expect(recordTypeName("task_tags_relation")).toBe("TaskTagsRelationRecord");
+    expect(pascalCase("current_users")).toBe("CurrentUsers");
   });
 
   test("a Symbol objectType reached through a reference is reported, not thrown (review 16, finding 1)", () => {

@@ -42,6 +42,7 @@
 import { canonicalKey, isKeyValue, ownField } from "./canonicalKey";
 import type { DataEventHandler, IndexValue } from "./EventHandler";
 import { foreignKeyGuard, type ModelDefinition } from "./ModelDefinitions";
+import { hasOwnerSlot, setOwner } from "./storeOwner";
 
 type Row = Record<string, unknown>;
 
@@ -50,6 +51,8 @@ export interface BucketContext {
   readonly events: DataEventHandler;
   /** The bucket for an object type; `undefined` if the store has none (a schema/wiring error, reported by the caller). */
   bucket(objectType: string): DataCacheIndex<object> | undefined;
+  /** The store the buckets belong to. Stamped on every stored model (see storeOwner.ts) so its accessors read this store. */
+  readonly owner?: object;
 }
 
 /** Something a remove can name: an id, or an object carrying the index field. */
@@ -214,6 +217,8 @@ export class DataCacheIndex<T extends object> {
   add(objects: readonly T[]): void {
     if (objects.length === 0) return;
     for (const object of objects) this.assertWritable(object);
+    const owner = this.context.owner;
+    if (owner !== undefined) for (const object of objects) if (hasOwnerSlot(object)) setOwner(object, owner);
 
     const byId = this.ensureById();
     const positions = this.positions();

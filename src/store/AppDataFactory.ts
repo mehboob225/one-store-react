@@ -4,6 +4,5 @@
  * its buses. Nothing else holds server data.
  */
 import { DataCache } from "./DataCache";
-import { ModelDefinitions } from "./ModelDefinitions";
 
-export const AppDataFactory = new DataCache(ModelDefinitions);
+export const AppDataFactory = new DataCache();

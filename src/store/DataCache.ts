@@ -45,12 +45,14 @@ export class DataCache {
   readonly tags: DataCacheIndex<TagModelAppData>;
   readonly task_tags_relation: DataCacheIndex<TaskTagsRelationRecord>;
 
-  constructor(definitions: Record<string, ModelDefinition> = ModelDefinitions, onListenerError?: ListenerErrorHandler) {
-    assertValidModelDefinitions(definitions);
+  /** The buckets are generated for ModelDefinitions, so that is the only schema a DataCache can hold. */
+  constructor(onListenerError?: ListenerErrorHandler) {
+    assertValidModelDefinitions(ModelDefinitions);
     this.eventsHandler = new DataEventHandler(onListenerError);
     this.updatedHandler = new EventHandler<string>(onListenerError);
     const buckets = new Map<string, DataCacheIndex<object>>();
-    const context: BucketContext = { events: this.eventsHandler, bucket: (objectType) => buckets.get(objectType) };
+    const context: BucketContext = { events: this.eventsHandler, bucket: (objectType) => buckets.get(objectType), owner: this };
+    const definitions: Record<string, ModelDefinition> = ModelDefinitions;
     this.users = new DataCacheIndex<UserModelAppData>("users", definitions, context);
     buckets.set("users", this.users);
     this.current_users = new DataCacheIndex<CurrentUserModelAppData>("current_users", definitions, context);

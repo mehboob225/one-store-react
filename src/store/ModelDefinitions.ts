@@ -245,6 +245,17 @@ const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
  * member, class name or property by the generator: JS reserved words, the
  * members every object/class already has, and PassiveModel's own methods.
  */
+/**
+ * Names that change how EVERY instance behaves when present as a property:
+ * a thenable hangs `await`, `toJSON` rewrites serialisation. Reserved for
+ * declared fields here and refused for JSON fields at runtime (PassiveModel).
+ */
+const INSTANCE_BEHAVIOUR_NAMES: readonly string[] = Object.freeze(["then", "toJSON"]);
+
+export function isInstanceBehaviourName(name: string): boolean {
+  return INSTANCE_BEHAVIOUR_NAMES.includes(name);
+}
+
 const RESERVED = new Set([
   // reserved words (ES2020 + strict mode)
   "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete", "do", "else", "enum",
@@ -254,8 +265,7 @@ const RESERVED = new Set([
   // class / object plumbing
   "constructor", "prototype", "__proto__", "__defineGetter__", "__defineSetter__", "__lookupGetter__", "__lookupSetter__",
   "hasOwnProperty", "isPrototypeOf", "propertyIsEnumerable", "toString", "toLocaleString", "valueOf",
-  // names that change how every instance behaves: a thenable hangs `await`, toJSON rewrites serialisation
-  "then", "toJSON",
+  ...INSTANCE_BEHAVIOUR_NAMES,
   // PassiveModel (step 8) instance API
   "initializeFromJson", "clone",
 ]);
@@ -263,8 +273,36 @@ const RESERVED = new Set([
 /** Additionally reserved for generated members (getters, relation names): the model's own `id` field. */
 const RESERVED_MEMBERS = new Set([...RESERVED, "id"]);
 
-/** Additionally reserved for bucket names: DataCache's own members (step 8). */
-const RESERVED_BUCKET_NAMES = new Set([...RESERVED_MEMBERS, "generation", "reset", "eventsHandler", "updatedHandler"]);
+/**
+ * Additionally reserved for bucket names: every member of the generated
+ * DataCache (step 8), since buckets are its properties. A test derives this
+ * list from the class so the two cannot drift.
+ */
+const RESERVED_BUCKET_NAMES = new Set([...RESERVED_MEMBERS, "generation", "reset", "eventsHandler", "updatedHandler", "buckets", "bucket", "objectTypes"]);
+
+// ---------------------------------------------------------------------------
+// Generated names: the one place a schema name becomes a code name, shared by
+// the validator (which reports collisions) and the generator (which emits them).
+// ---------------------------------------------------------------------------
+
+/** `task_tags_relation` → `TaskTagsRelation`; `""` when the name has no letters or digits. */
+export function pascalCase(name: string): string {
+  return name
+    .split(/[^A-Za-z0-9]+/)
+    .filter((part) => part.length > 0)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join("");
+}
+
+/** The accessor the generator emits for a metaData key: `subscription` → `getSubscription()`. */
+export function metaDataGetterName(key: string): string {
+  return `get${pascalCase(key)}`;
+}
+
+/** The interface the generator emits for the rows of a type without a model class: `comments` → `CommentsRecord`. */
+export function recordTypeName(objectType: string): string {
+  return `${pascalCase(objectType)}Record`;
+}
 
 /**
  * Reserved for generated class names: the ECMAScript built-ins a generated
@@ -368,8 +406,30 @@ export function validateModelDefinitions(definitions: Record<string, ModelDefini
     const ctx: TypeContext = { definitions, problems, models, type, def, fields: new Map(), members: new Map() };
     for (const check of TYPE_CHECKS) check(ctx);
   }
+  checkGeneratedRecordNames(definitions, problems);
 
   return problems;
+}
+
+/**
+ * Every type without a model class gets a generated `<Type>Record` interface.
+ * Two types whose names differ only in case or separators would generate the
+ * same interface, which TypeScript silently MERGES; a name with no letters or
+ * digits would generate the bare `Record`, shadowing the built-in.
+ */
+function checkGeneratedRecordNames(definitions: Record<string, ModelDefinition>, problems: string[]): void {
+  const records = new Map<string, string>();
+  for (const [type, def] of Object.entries(definitions)) {
+    if (!isRecord(def) || def.model !== undefined) continue;
+    if (pascalCase(type) === "") {
+      problems.push(`${type}: no generated record name can be derived (the name has no letters or digits)`);
+      continue;
+    }
+    const name = recordTypeName(type);
+    const other = records.get(name);
+    if (other !== undefined) problems.push(`${type}: generated record name "${name}" is also generated for "${other}"`);
+    else records.set(name, type);
+  }
 }
 
 /** State for validating one type. `problems` and `models` are shared across the whole map. */
@@ -438,7 +498,7 @@ function collectFields(ctx: TypeContext): void {
  * identifier, must not collide with a data field of the same class, and must
  * be unique among the type's members.
  */
-function claimMember(ctx: TypeContext, kind: "getter" | "relation name" | "key", name: unknown, owner: string): void {
+function claimMember(ctx: TypeContext, kind: "getter" | "relation name", name: unknown, owner: string): void {
   if (typeof name !== "string") {
     problem(ctx, `${owner} ${kind} is missing or not a string`);
     return;
@@ -626,7 +686,10 @@ function checkMetaData(ctx: TypeContext): void {
       problem(ctx, `metaData lists "${key}" twice`);
     } else {
       seen.add(key);
-      claimMember(ctx, "key", key, `metaData.${key}`); // the generator emits an accessor per key
+      // side data is read through getMetaData; a data field of the same name would be a second, ambiguous source
+      const field = ctx.fields.get(key);
+      if (field) problem(ctx, `metaData key "${key}" is also the data field declared by ${field}`);
+      claimMember(ctx, "getter", metaDataGetterName(key), `metaData.${key}`); // the generator emits getX() per key
     }
   }
 }

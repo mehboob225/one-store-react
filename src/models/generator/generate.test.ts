@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { ModelDefinitions, type ModelDefinition } from "../../store/ModelDefinitions";
-import { GENERATED_HEADER, generateModels, pascalCase } from "./generate";
+import { GENERATED_HEADER, generateModels, OWNED_DIRECTORIES } from "./generate";
 
 const root = new URL("../../../", import.meta.url);
 
@@ -36,10 +36,21 @@ describe("generateModels", () => {
     expect(() => generateModels({ a: { index: "id", foreignKeys: { b_id: { objectType: "b", getter: "getB" } } } })).toThrow(/points at unknown type "b"/);
   });
 
-  test("pascalCase", () => {
-    expect(pascalCase("task_tags_relation")).toBe("TaskTagsRelation");
-    expect(pascalCase("users")).toBe("Users");
-    expect(pascalCase("current_users")).toBe("CurrentUsers");
+  test("--check flags an orphaned *AppData.ts file, and a write deletes it (step 8 review, finding 4)", async () => {
+    const orphan = new URL(`${OWNED_DIRECTORIES[0]}/OrphanModelAppData.ts`, root);
+    await Bun.write(orphan, "// an orphan left behind by a renamed model\n");
+    try {
+      const check = Bun.spawnSync(["bun", "scripts/generate-models.ts", "--check"], { cwd: root.pathname });
+      expect(check.exitCode).toBe(1);
+      expect(check.stderr.toString()).toContain("src/models/appdata/OrphanModelAppData.ts (orphan: no definition generates it)");
+      const write = Bun.spawnSync(["bun", "scripts/generate-models.ts"], { cwd: root.pathname });
+      expect(write.exitCode).toBe(0);
+      expect(write.stdout.toString()).toContain("deleted orphan src/models/appdata/OrphanModelAppData.ts");
+      expect(write.stdout.toString()).not.toContain("wrote"); // nothing else changed
+      expect(await Bun.file(orphan).exists()).toBe(false);
+    } finally {
+      await Bun.file(orphan).delete().catch(() => undefined);
+    }
   });
 
   test("every schema property becomes the documented member; plain types become record interfaces", () => {
@@ -55,6 +66,7 @@ describe("generateModels", () => {
       },
       homes: { index: "id" },
       pets: { index: "id", model: "PetModel", foreignKeys: { owner_uid: { objectType: "owners", getter: "getOwner" } } },
+      lonely: { index: "id", model: "LonelyModel" },
       friendships: {
         index: "id",
         foreignKeys: { owner_uid: { objectType: "owners", getter: "getOwner" }, friend_uid: { objectType: "owners", getter: "getFriend" } },
@@ -62,23 +74,35 @@ describe("generateModels", () => {
       },
     };
     const files = new Map(generateModels(defs).map((f) => [f.path, f.content]));
-    expect([...files.keys()]).toEqual(["src/store/DataCache.ts", "src/models/appdata/OwnerModelAppData.ts", "src/models/appdata/PetModelAppData.ts"]);
+    expect([...files.keys()]).toEqual([
+      "src/store/DataCache.ts",
+      "src/models/appdata/OwnerModelAppData.ts",
+      "src/models/appdata/PetModelAppData.ts",
+      "src/models/appdata/LonelyModelAppData.ts",
+    ]);
 
     const owner = files.get("src/models/appdata/OwnerModelAppData.ts")!;
-    expect(owner).toContain("export class OwnerModelAppData extends PassiveModel {");
+    expect(owner).toContain("export class OwnerModelAppData extends PassiveModel<DataCache> {");
     expect(owner).toContain("  declare uid: IndexValue;\n  declare boss_uid?: IndexValue | null;\n  declare home_id?: IndexValue | null;\n  declare pet_ids?: readonly IndexValue[] | null;\n");
-    expect(owner).toContain("  getBoss(): OwnerModelAppData | undefined {\n    return AppDataFactory.owners.getById(this.boss_uid);\n  }");
-    expect(owner).toContain("  getHome(): HomesRecord | undefined {\n    return AppDataFactory.homes.getById(this.home_id);\n  }");
-    expect(owner).toContain("  getPets(): PetModelAppData[] {\n    return AppDataFactory.pets.getMultipleByIds(this.pet_ids ?? []);\n  }");
-    expect(owner).toContain('  getOwnedPets(): readonly PetModelAppData[] {\n    return AppDataFactory.pets.getGroupedById("owner_uid", this.uid);\n  }');
+    expect(owner).toContain("  getBoss(): OwnerModelAppData | undefined {\n    return storeOf(this).owners.getById(this.boss_uid);\n  }");
+    expect(owner).toContain("  getHome(): HomesRecord | undefined {\n    return storeOf(this).homes.getById(this.home_id);\n  }");
+    expect(owner).toContain("  getPets(): PetModelAppData[] {\n    return storeOf(this).pets.getMultipleByIds(this.pet_ids ?? []);\n  }");
+    expect(owner).toContain('  getOwnedPets(): readonly PetModelAppData[] {\n    return storeOf(this).pets.getGroupedById("owner_uid", this.uid);\n  }');
     expect(owner).toContain(
-      '  getFriends(): OwnerModelAppData[] {\n    return AppDataFactory.owners.getAssociation<OwnerModelAppData>("friendships", "owner_uid", "friend_uid", this.uid);\n  }',
+      '  getFriends(): OwnerModelAppData[] {\n    return storeOf(this).owners.getAssociation<OwnerModelAppData>("friendships", "owner_uid", "friend_uid", this.uid);\n  }',
     );
-    expect(owner).toContain('  get limits(): unknown {\n    return AppDataFactory.owners.getMetaData(this.uid, "limits");\n  }');
-    // imports: the referenced model bases and records, never itself
-    expect(owner).toContain('import type { HomesRecord } from "../../store/DataCache";');
+    expect(owner).toContain('  getLimits(): unknown {\n    return storeOf(this).owners.getMetaData(this.uid, "limits");\n  }');
+    // imports: the store type, the referenced model bases and records, never itself and never the singleton
+    expect(owner).toContain('import { PassiveModel, storeOf } from "../generator/PassiveModel";');
+    expect(owner).toContain('import type { DataCache, HomesRecord } from "../../store/DataCache";');
     expect(owner).toContain('import type { PetModelAppData } from "./PetModelAppData";');
     expect(owner).not.toContain('from "./OwnerModelAppData"');
+    for (const content of files.values()) expect(content).not.toContain("AppDataFactory");
+    // a model without relations gets no accessor and no storeOf import
+    const lonely = files.get("src/models/appdata/LonelyModelAppData.ts")!;
+    expect(lonely).toContain('import { PassiveModel } from "../generator/PassiveModel";');
+    expect(lonely).not.toContain("storeOf");
+    expect(lonely).toContain("export class LonelyModelAppData extends PassiveModel<DataCache> {\n  declare id: IndexValue;\n}");
 
     const cache = files.get("src/store/DataCache.ts")!;
     expect(cache).toContain("export interface HomesRecord extends Record<string, unknown> {\n  id: IndexValue;\n}");
@@ -87,6 +111,8 @@ describe("generateModels", () => {
     );
     expect(cache).toContain("  readonly owners: DataCacheIndex<OwnerModelAppData>;\n  readonly homes: DataCacheIndex<HomesRecord>;");
     expect(cache).toContain('    this.friendships = new DataCacheIndex<FriendshipsRecord>("friendships", definitions, context);');
+    expect(cache).toContain("  constructor(onListenerError?: ListenerErrorHandler) {"); // no definitions parameter: the buckets are fixed to the schema
+    expect(cache).toContain("owner: this }");
     expect(cache).not.toContain("HomesRecord } from"); // records live in this file
   });
 });

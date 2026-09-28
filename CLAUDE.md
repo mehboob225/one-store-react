@@ -44,6 +44,8 @@ only by the tab that performs the transition. Persisted UI state must use that p
 - Every factory method ends in a store write (`saveAppData` / `deleteAppData`).
 - Model classes extend their generated `*AppData` base and declare fields with `declare` (the base
   constructor assigns the JSON; a plain field would reset it to `undefined`).
+- A model's accessors resolve through the store that holds it (`storeOf(model)`, set when a bucket
+  stores it); nothing under `src/models` imports `AppDataFactory`.
 
 ---
 
