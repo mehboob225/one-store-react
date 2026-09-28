@@ -147,18 +147,23 @@ export function createRoutes(ctx: RouteContext) {
     "/api/v1/projects/:id/tasks/import": {
       POST: authed<"/api/v1/projects/:id/tasks/import">((req, userId) => {
         const projectId = Number(req.params.id);
-        // Authorize once, before any write.
-        const access = db.canWriteProject(projectId, userId);
-        if (access === "missing") return notFound("project");
-        if (access === "forbidden") return forbidden();
         const titles = ["Imported: triage backlog", "Imported: write docs", "Imported: plan release"];
-        const outcomes = titles.map((title) => db.createTask(projectId, { title }, userId));
-        // The titles are server constants: a rejected one is a server bug, not a client error.
-        const rejected = outcomes.find((o) => o.kind === "invalid");
-        if (rejected) throw new Error(`import: a server-owned title was rejected: ${rejected.error}`);
-        const imported = outcomes.filter((o) => o.kind === "created").length; // what was written, not attempted
-        if (imported > 0) push.broadcast({ type: "reload", objectType: "project", objectId: projectId });
-        return Response.json({ imported });
+        // All or nothing in the db: authorized once, every title validated before any row is written.
+        const outcome = db.importTasks(projectId, titles.map((title) => ({ title })), userId);
+        switch (outcome.kind) {
+          case "missing":
+            return notFound("project");
+          case "forbidden":
+            return forbidden();
+          case "invalid":
+            // The titles are server constants: a rejected one is a server bug, not a client error — and nothing was written.
+            throw new Error(`import: a server-owned title was rejected: ${outcome.error}`);
+          case "imported": {
+            const imported = outcome.tasks.length;
+            if (imported > 0) push.broadcast({ type: "reload", objectType: "project", objectId: projectId });
+            return Response.json({ imported });
+          }
+        }
       }),
     },
 

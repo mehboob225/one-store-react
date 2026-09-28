@@ -50,7 +50,13 @@ export type UpdateOutcome =
 
 export type DeleteOutcome = { kind: "missing" } | { kind: "forbidden" } | { kind: "deleted"; task: TaskRow; comments: CommentRow[] };
 
-const ASSIGNEE_RULE = "task.assignee_id must be the project owner or a project member";
+/** Outcome of `importTasks`: all or nothing — on `invalid` no row was written. */
+export type ImportOutcome = { kind: "missing" } | { kind: "forbidden" } | { kind: "invalid"; error: string } | { kind: "imported"; tasks: TaskRow[] };
+
+/** The one authorization step for writing to a project: 404 before 403, then the loaded row. */
+type Authorized = { kind: "missing" } | { kind: "forbidden" } | { kind: "ok"; project: ProjectRow };
+
+const ASSIGNEE_RULE = "task.assignee_id must be a project member";
 
 export class Database {
   private data: SeedData;
@@ -145,9 +151,31 @@ export class Database {
    * client's `getMembers()` — is the complete list.
    */
   canWriteProject(projectId: number, actorId: number): "missing" | "forbidden" | "ok" {
+    return this.authorize(projectId, actorId).kind;
+  }
+
+  /** Finds the project and checks membership, in that order, for every write. */
+  private authorize(projectId: number, actorId: number): Authorized {
     const project = this.data.projects.find((p) => p.id === projectId);
-    if (!project) return "missing";
-    return isMember(project, actorId) ? "ok" : "forbidden";
+    if (!project) return { kind: "missing" };
+    if (!isMember(project, actorId)) return { kind: "forbidden" };
+    return { kind: "ok", project };
+  }
+
+  /** Writes a validated task into a loaded project. Cannot fail: every check has already run. */
+  private insertTask(project: ProjectRow, input: NewTask): TaskRow {
+    const id = this.nextId.tasks++;
+    const task: TaskRow = {
+      id,
+      project_id: project.id,
+      assignee_id: input.assignee_id ?? null,
+      title: input.title,
+      status: input.status ?? "todo",
+      due_on: input.due_on ?? null,
+      hash: `t${id}-1`,
+    };
+    this.data.tasks.push(task);
+    return clone(task);
   }
 
   hasProject(id: number): boolean {
@@ -165,25 +193,33 @@ export class Database {
    * here, next to the write, so every writer (routes, imports, tests) gets them.
    */
   createTask(projectId: number, body: unknown, actorId: number): CreateOutcome {
-    const project = this.data.projects.find((p) => p.id === projectId); // one lookup serves every check
-    if (!project) return { kind: "missing" };
-    if (!isMember(project, actorId)) return { kind: "forbidden" };
+    const access = this.authorize(projectId, actorId);
+    if (access.kind !== "ok") return access;
     const validated = validateNewTask(body);
     if (!validated.ok) return { kind: "invalid", error: validated.error };
     const input: NewTask = validated.value;
-    if (input.assignee_id != null && !isMember(project, input.assignee_id)) return { kind: "invalid", error: ASSIGNEE_RULE };
-    const id = this.nextId.tasks++;
-    const task: TaskRow = {
-      id,
-      project_id: projectId,
-      assignee_id: input.assignee_id ?? null,
-      title: input.title,
-      status: input.status ?? "todo",
-      due_on: input.due_on ?? null,
-      hash: `t${id}-1`,
-    };
-    this.data.tasks.push(task);
-    return { kind: "created", task: clone(task) };
+    if (input.assignee_id != null && !isMember(access.project, input.assignee_id)) return { kind: "invalid", error: ASSIGNEE_RULE };
+    return { kind: "created", task: this.insertTask(access.project, input) };
+  }
+
+  /**
+   * Creates several tasks, all or nothing: authorizes once, validates every
+   * body before writing any row, then inserts them all. An `invalid` outcome
+   * means nothing was written.
+   */
+  importTasks(projectId: number, bodies: readonly unknown[], actorId: number): ImportOutcome {
+    const access = this.authorize(projectId, actorId);
+    if (access.kind !== "ok") return access;
+    const inputs: NewTask[] = [];
+    for (const body of bodies) {
+      const validated = validateNewTask(body);
+      if (!validated.ok) return { kind: "invalid", error: validated.error };
+      if (validated.value.assignee_id != null && !isMember(access.project, validated.value.assignee_id)) {
+        return { kind: "invalid", error: ASSIGNEE_RULE };
+      }
+      inputs.push(validated.value);
+    }
+    return { kind: "imported", tasks: inputs.map((input) => this.insertTask(access.project, input)) };
   }
 
   /**
@@ -203,9 +239,9 @@ export class Database {
   updateTask(id: number, body: unknown, actorId: number): UpdateOutcome {
     const task = this.data.tasks.find((t) => t.id === id);
     if (!task) return { kind: "missing" };
-    const project = this.data.projects.find((p) => p.id === task.project_id);
-    if (!project) return { kind: "missing" }; // an orphan task is unwritable; the seed invariant makes this unreachable
-    if (!isMember(project, actorId)) return { kind: "forbidden" };
+    const access = this.authorize(task.project_id, actorId); // an orphan task is `missing` (the seed invariant makes it unreachable)
+    if (access.kind !== "ok") return access;
+    const { project } = access;
     const envelope = validateTaskEnvelope(body);
     if (!envelope.ok) return { kind: "invalid", error: envelope.error };
     if (envelope.value.hash !== task.hash) return { kind: "conflict", current: clone(task) };
@@ -227,13 +263,11 @@ export class Database {
 
   /** Removes the task and its comments + tag links, if the actor is on its project. */
   deleteTask(id: number, actorId: number): DeleteOutcome {
-    const index = this.data.tasks.findIndex((t) => t.id === id);
-    if (index === -1) return { kind: "missing" };
-    const task = this.data.tasks[index]!;
-    const project = this.data.projects.find((p) => p.id === task.project_id); // same shape as create/update
-    if (!project) return { kind: "missing" };
-    if (!isMember(project, actorId)) return { kind: "forbidden" };
-    this.data.tasks.splice(index, 1);
+    const task = this.data.tasks.find((t) => t.id === id);
+    if (!task) return { kind: "missing" };
+    const access = this.authorize(task.project_id, actorId);
+    if (access.kind !== "ok") return access;
+    this.data.tasks = this.data.tasks.filter((t) => t !== task);
 
     const comments = this.data.comments.filter((c) => c.task_id === id);
     this.data.comments = this.data.comments.filter((c) => c.task_id !== id);

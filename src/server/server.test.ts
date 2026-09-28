@@ -248,7 +248,7 @@ describe("projects and tasks", () => {
       // 999 does not exist; 3 (Alan) exists but is on no project
       const created = await post({ title: "x", assignee_id });
       expect(created.status).toBe(400);
-      expect(((await created.json()) as { error: string }).error).toContain("project owner or a project member");
+      expect(((await created.json()) as { error: string }).error).toBe("task.assignee_id must be a project member");
     }
     expect((await post({ title: "x", assignee_id: 2 })).status).toBe(201); // Grace is a member of project 1
 
@@ -303,7 +303,7 @@ describe("projects and tasks", () => {
   });
 
   test("validation and the assignee rule are enforced by the data layer, not only by the routes", () => {
-    expect(mock.db.createTask(1, { title: "x", assignee_id: 3 }, 1)).toEqual({ kind: "invalid", error: expect.stringContaining("owner or a project member") });
+    expect(mock.db.createTask(1, { title: "x", assignee_id: 3 }, 1)).toEqual({ kind: "invalid", error: "task.assignee_id must be a project member" });
     expect(mock.db.createTask(1, { title: "x", assignee_id: 1 }, 1).kind).toBe("created"); // the owner (always a member)
     expect(mock.db.createTask(1, "nope", 1)).toEqual({ kind: "invalid", error: "task must be an object" });
     expect(mock.db.createTask(1, { title: "" }, 1)).toEqual({ kind: "invalid", error: "task.title must be a non-empty string" });
@@ -376,24 +376,34 @@ describe("projects and tasks", () => {
     for (const p of mock.db.listProjects()) expect(p.member_ids).toContain(p.owner_id);
   });
 
-  test("the import route reports what was written and broadcasts only then (review 11 finding 2, review 12 findings 3, 7)", async () => {
+  test("the import is all or nothing: nothing is written on a rejected title, and a reload is broadcast only after writes (reviews 11–15)", async () => {
+    // db level: a body that fails validation means no row is written at all
+    const before = mock.db.listTasks(2).length;
+    expect(mock.db.importTasks(2, [{ title: "ok" }, { title: "" }, { title: "also ok" }], 2)).toEqual({ kind: "invalid", error: "task.title must be a non-empty string" });
+    expect(mock.db.listTasks(2).length).toBe(before);
+    expect(mock.db.importTasks(2, [{ title: "ok" }, { title: "also ok" }], 3).kind).toBe("forbidden"); // Alan is not on project 2
+    expect(mock.db.importTasks(999, [{ title: "ok" }], 2).kind).toBe("missing");
+    const done = mock.db.importTasks(2, [{ title: "ok" }, { title: "also ok" }], 2);
+    expect(done.kind).toBe("imported");
+    expect(mock.db.listTasks(2).length).toBe(before + 2);
+
+    // route level: the normal case creates everything and broadcasts once
     const broadcasts: unknown[] = [];
     const originalBroadcast = mock.push.broadcast.bind(mock.push);
-    const originalCreate = mock.db.createTask.bind(mock.db);
+    const originalImport = mock.db.importTasks.bind(mock.db);
     mock.push.broadcast = (message) => {
       broadcasts.push(message);
       originalBroadcast(message);
     };
     try {
-      // the normal case: everything created, one reload
       const body = (await (await api("/projects/2/tasks/import", { method: "POST" })).json()) as { imported: number };
       expect(body.imported).toBe(3);
       expect(broadcasts).toEqual([{ type: "reload", objectType: "project", objectId: 2 }]);
 
-      // the titles are server constants, so a rejected one is a server bug: 500, not a quiet short count
+      // a rejected server-owned title is a server bug: 500, nothing written, nothing broadcast
       broadcasts.length = 0;
-      let calls = 0;
-      mock.db.createTask = (projectId, body, actorId) => (++calls === 2 ? { kind: "invalid", error: "stubbed" } : originalCreate(projectId, body, actorId));
+      const count = mock.db.listTasks(2).length;
+      mock.db.importTasks = () => ({ kind: "invalid", error: "stubbed" });
       const originalError = console.error;
       console.error = () => {}; // the server logs the deliberate exception; keep the runner output clean
       try {
@@ -404,8 +414,9 @@ describe("projects and tasks", () => {
         console.error = originalError;
       }
       expect(broadcasts).toEqual([]);
+      expect(mock.db.listTasks(2).length).toBe(count);
     } finally {
-      mock.db.createTask = originalCreate;
+      mock.db.importTasks = originalImport;
       mock.push.broadcast = originalBroadcast;
     }
     expect((await api("/projects/999/tasks/import", { method: "POST" })).status).toBe(404);

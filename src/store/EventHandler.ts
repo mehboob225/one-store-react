@@ -47,30 +47,25 @@
  *  - a throwing listener never stops the others;
  *  - a `flush()` requested from inside a flush runs after the current one,
  *    so batches are always delivered in the order they were queued;
- *  - a selector that can never fire (undefined/NaN/"" id or key, half a
- *    foreign key) is a bug: `subscribe` reports it through the error handler
- *    and returns a no-op unsubscribe rather than throwing mid-render;
- *    `eventKey` throws, for tests and callers that want the exception.
+ *  - a selector that can never fire (undefined/NaN/"" id or key, an empty
+ *    field name, half a foreign key) is a programming error and THROWS from
+ *    `subscribe` and `eventKey`. Subscribers are the timestamp atoms, whose
+ *    ids come from route params that the param hook validates first (step
+ *    14/16); a bad id reaching the bus must be loud, not a stale screen.
  */
 
 import { canonicalKey, hasField, isKeyValue, ownField } from "./canonicalKey";
 
 export type Unsubscribe = () => void;
 
-/**
- * What the bus reports through its error handler:
- *  - `listener`: a listener threw during delivery (the others still run);
- *  - `selector`: `subscribe` was given a selector that can never fire (it
- *    was not registered; the caller got a no-op unsubscribe).
- */
-export type BusErrorContext = { kind: "listener" | "selector"; key?: string };
+/** What the bus reports through its error handler: a listener threw during delivery (the others still run). */
+export type BusErrorContext = { kind: "listener"; key?: string };
 
 /** Receives every report; the default logs to the console. */
 export type ListenerErrorHandler = (error: unknown, context: BusErrorContext) => void;
 
 const defaultErrorHandler: ListenerErrorHandler = (error, context) => {
-  const where = context.key ? ` "${context.key}"` : "";
-  console.error(context.kind === "selector" ? `subscribe: invalid selector${where}, it can never fire` : `listener for${where} threw`, error);
+  console.error(context.key ? `listener for "${context.key}" threw` : "listener threw", error);
 };
 
 /** Reports a listener error; a throwing custom handler must not escape delivery either. */
@@ -199,14 +194,19 @@ type Resolved =
  * Subscribe conditionally instead.
  */
 function resolve(selector: DataEventSelector): Resolved {
-  const { objectType, id, keyName, key } = selector as { objectType: string; id?: unknown; keyName?: unknown; key?: unknown };
+  // Selector fields are read with the same own-property rule as data fields.
+  const fields = selector as unknown as Record<string, unknown>;
+  const objectType = String(ownField(fields, "objectType"));
+  const id = ownField(fields, "id");
+  const keyName = ownField(fields, "keyName");
+  const key = ownField(fields, "key");
   const hasId = id != null;
   const hasForeignKey = keyName != null || key != null;
   if (hasId && hasForeignKey) {
     throw new TypeError(`eventKey: selector for "${objectType}" has both an id and a foreign key; pick one`);
   }
   if (hasForeignKey) {
-    if (!isKeyValue(keyName) || typeof keyName !== "string" || !isKeyValue(key)) {
+    if (typeof keyName !== "string" || !isKeyValue(keyName) || !isKeyValue(key)) {
       throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key (a finite number or non-empty string)`);
     }
     const value = canonicalKey(key);
@@ -217,7 +217,7 @@ function resolve(selector: DataEventSelector): Resolved {
     const canon = canonicalKey(id);
     return { kind: "id", objectType, id: canon, label: `${objectType}/${canon}` };
   }
-  if ("id" in selector || "key" in selector || "keyName" in selector) {
+  if (hasField(fields, "id") || hasField(fields, "key") || hasField(fields, "keyName")) {
     throw new TypeError(`eventKey: selector for "${objectType}" has an undefined id or key; use { objectType } for the bucket`);
   }
   return { kind: "bucket", objectType, label: objectType };
@@ -256,18 +256,9 @@ export class DataEventHandler {
 
   /** Subscribes to a selector (bucket, object, or foreign-key value). Each call is its own subscription. */
   subscribe(selector: DataEventSelector, listener: DataEventListener): Unsubscribe {
-    // Resolved once: unsubscribe must not re-read a selector the caller may have mutated since.
-    let resolved: Resolved;
-    try {
-      resolved = resolve(selector);
-    } catch (error) {
-      // A selector that can never fire (NaN or "" from an unparsed route param, half a foreign
-      // key…) is a bug, but not one worth taking a render tree down for: report it loudly through
-      // the bus's error handler and hand back a no-op unsubscribe. `eventKey` still throws, for
-      // callers that want the exception.
-      report(this.onListenerError, error, { kind: "selector", key: describeSelector(selector) });
-      return () => {};
-    }
+    // Resolved once (and validated: a selector that can never fire throws here, see the contract
+    // above): unsubscribe must not re-read a selector the caller may have mutated since.
+    const resolved = resolve(selector);
     const entry: Entry<DataEventBatch> = { listener };
     const target = this.targetFor(resolved, true)!;
     target.add(entry);
@@ -334,15 +325,7 @@ export class DataEventHandler {
 
   /** Number of listeners for a selector (or in total). Mostly for tests and diagnostics. */
   listenerCount(selector?: DataEventSelector): number {
-    if (selector) {
-      let resolved: Resolved;
-      try {
-        resolved = resolve(selector);
-      } catch {
-        return 0; // a selector `subscribe` would have refused has no listeners, by construction
-      }
-      return this.targetFor(resolved, false)?.size ?? 0;
-    }
+    if (selector) return this.targetFor(resolve(selector), false)?.size ?? 0; // throws for an invalid selector, like subscribe
     let total = 0;
     for (const type of this.types.values()) {
       total += type.bucket.size;
@@ -474,25 +457,6 @@ function getOrCreate(map: Map<string, Target>, key: string, create: boolean): Ta
     map.set(key, target);
   }
   return target;
-}
-
-/** Best-effort label for an invalid selector in an error report. Must never throw: it runs inside a catch. */
-function describeSelector(selector: unknown): string {
-  try {
-    if (typeof selector !== "object" || selector === null) return `<${typeof selector}>`;
-    const { objectType, id, keyName, key } = selector as { objectType?: unknown; id?: unknown; keyName?: unknown; key?: unknown };
-    const show = (v: unknown) => {
-      try {
-        return typeof v === "symbol" ? v.toString() : String(v);
-      } catch {
-        return "<unprintable>";
-      }
-    };
-    const fk = keyName !== undefined || key !== undefined ? `/${show(keyName)}/${show(key)}` : "";
-    return `${show(objectType)}${id !== undefined ? `/${show(id)}` : ""}${fk}`;
-  } catch {
-    return "<invalid selector>";
-  }
 }
 
 function indexById(objects: readonly Row[], index: string): Map<string, Row> {

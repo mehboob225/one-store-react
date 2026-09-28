@@ -6,6 +6,7 @@
  * fields are dropped; badly typed values are rejected before anything is
  * written or broadcast.
  */
+import { hasField, ownField } from "../store/canonicalKey";
 import type { NewTask, TaskFields } from "./db";
 import type { TaskRow } from "./fixtures";
 
@@ -22,11 +23,6 @@ export type MutableTaskField = (typeof MUTABLE_TASK_FIELDS)[number];
 
 export function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/** Reads a body field as an OWN property only — the same rule as every field read in this codebase. */
-function ownProp(record: Record<string, unknown>, key: string): unknown {
-  return Object.hasOwn(record, key) ? record[key] : undefined;
 }
 
 function validateTaskField(field: MutableTaskField, value: unknown): string | undefined {
@@ -47,7 +43,7 @@ function validateTaskField(field: MutableTaskField, value: unknown): string | un
 /** Copies the mutable fields present in `body` into `target`, validating each. */
 function collectTaskFields(body: Record<string, unknown>, target: Record<string, unknown>): string | undefined {
   for (const field of MUTABLE_TASK_FIELDS) {
-    if (!Object.hasOwn(body, field)) continue; // own properties only, like every other field read in this codebase
+    if (!hasField(body, field)) continue; // the one field-reading rule (canonicalKey.ts)
     const problem = validateTaskField(field, body[field]);
     if (problem) return problem;
     target[field] = body[field]; // own: checked above
@@ -58,7 +54,7 @@ function collectTaskFields(body: Record<string, unknown>, target: Record<string,
 /** `POST /projects/:id/tasks` body (`task`): title required, other fields optional. */
 export function validateNewTask(input: unknown): Validated<NewTask> {
   if (!isPlainObject(input)) return fail("task must be an object");
-  if (!Object.hasOwn(input, "title")) return fail("task.title is required");
+  if (!hasField(input, "title")) return fail("task.title is required");
   const value: Record<string, unknown> = {};
   const problem = collectTaskFields(input, value);
   return problem ? fail(problem) : ok(value as unknown as NewTask);
@@ -72,7 +68,7 @@ export function validateNewTask(input: unknown): Validated<NewTask> {
  */
 export function validateTaskEnvelope(input: unknown): Validated<{ hash: string; body: Record<string, unknown> }> {
   if (!isPlainObject(input)) return fail("task must be an object");
-  const hash = ownProp(input, "hash");
+  const hash = ownField(input, "hash");
   if (typeof hash !== "string") return fail("task.hash must be a string");
   return ok({ hash, body: input });
 }
@@ -96,8 +92,8 @@ export function validateSettings(input: unknown): Validated<Record<string, unkno
 /** `POST /sign_in` body. */
 export function validateCredentials(input: unknown): Validated<{ email: string; password: string }> {
   if (!isPlainObject(input)) return fail("body must be an object");
-  const email = ownProp(input, "email");
-  const password = ownProp(input, "password");
+  const email = ownField(input, "email");
+  const password = ownField(input, "password");
   if (typeof email !== "string" || email === "" || typeof password !== "string" || password === "") {
     return fail("email and password are required strings");
   }

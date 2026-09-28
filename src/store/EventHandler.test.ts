@@ -89,22 +89,32 @@ describe("eventKey", () => {
     expect(eventKey({ objectType: "tasks", keyName: "project_id", key: 42 })).toBe("tasks/project_id/42");
   });
 
-  test("subscribe never throws, whatever the selector: exotic values are reported with a safe label (review 14, finding 2)", () => {
-    const reports: { key?: string }[] = [];
-    const bus = new DataEventHandler((_e, context) => reports.push(context));
+  test("a selector that can never fire THROWS from subscribe, whatever the shape of the bad input (contract; review 15, finding 3)", () => {
+    const bus = new DataEventHandler();
     const weird = [
       { objectType: "tasks", id: Object.create(null) as never },
-      { objectType: Symbol("t") as never, id: 1 },
-      null as never,
-      "tasks" as never,
       { objectType: "tasks", id: { toString: () => { throw new Error("no"); } } as never },
+      { objectType: "tasks", id: NaN },
+      { objectType: "tasks", id: "" },
+      { objectType: "tasks", keyName: "", key: 1 }, // an empty field name can never fire either
+      { objectType: "tasks", keyName: "project_id", key: " 1" },
     ];
-    for (const selector of weird) expect(() => bus.subscribe(selector, () => {})).not.toThrow();
-    expect(reports).toHaveLength(weird.length);
-    for (const r of reports) expect(typeof r.key).toBe("string");
-    expect(reports[2]!.key).toBe("<object>");
-    expect(reports[3]!.key).toBe("<string>");
+    for (const selector of weird) expect(() => bus.subscribe(selector, () => {})).toThrow(TypeError);
     expect(bus.listenerCount()).toBe(0);
+    // listenerCount agrees: the same selectors throw there too, they can have no listeners by construction
+    expect(() => bus.listenerCount({ objectType: "tasks", id: NaN })).toThrow(TypeError);
+  });
+
+  test("selector fields are read as own properties, like data fields (review 15, finding 8)", async () => {
+    const bus = new DataEventHandler();
+    const seen: string[] = [];
+    // an inherited `id` is not part of the selector: this is a bucket subscription
+    const inherited = Object.assign(Object.create({ id: 7 }) as Record<string, unknown>, { objectType: "tasks" });
+    bus.subscribe(inherited as never, (b) => seen.push(b.key));
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 1 }, { id: 7 }] });
+    await tick();
+    expect(seen).toEqual(["tasks"]);
+    expect(eventKey(inherited as never)).toBe("tasks");
   });
 
   test("defined values decide the shape; a lone undefined discriminator throws", () => {
@@ -112,14 +122,8 @@ describe("eventKey", () => {
     expect(() => eventKey({ objectType: "tasks", id: undefined } as never)).toThrow(/undefined id/);
     expect(() => eventKey({ objectType: "tasks", keyName: "project_id", key: undefined } as never)).toThrow(/both keyName and key/);
     const bus = new DataEventHandler();
-    const reported: unknown[] = [];
-    const reporting = new DataEventHandler((error) => reported.push(error));
-    const off = reporting.subscribe({ objectType: "tasks", id: undefined as unknown as number }, () => {});
-    expect(reported).toHaveLength(1); // reported, not thrown: a render must not die for a bad param
-    expect(reported[0]).toBeInstanceOf(TypeError);
-    expect(off).toBeInstanceOf(Function);
-    expect(() => off()).not.toThrow();
-    expect(reporting.listenerCount()).toBe(0);
+    expect(() => bus.subscribe({ objectType: "tasks", id: undefined as unknown as number }, () => {})).toThrow(TypeError);
+    expect(bus.listenerCount()).toBe(0);
   });
 
   test("selectors that would never fire throw: null or non-scalar id/key, and id together with a foreign key", () => {
@@ -213,21 +217,10 @@ describe("DataEventHandler", () => {
     bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: NaN }, { id: "" }, { id: " 1" }, { id: 2 }] });
     await tick();
     expect(ids).toEqual([2]);
-    // subscribe: reported through the error handler with the selector named, never thrown (review 13, finding 4)
-    const reports: { error: unknown; kind: string; key?: string }[] = [];
-    const reporting = new DataEventHandler((error, context) => reports.push({ error, ...context }));
-    reporting.subscribe({ objectType: "tasks", id: NaN }, () => {});
-    reporting.subscribe({ objectType: "tasks", id: "" }, () => {});
-    reporting.subscribe({ objectType: "tasks", keyName: "project_id", key: " 1" }, () => {});
-    reporting.subscribe({ objectType: "tasks", keyName: "", key: 1 }, () => {}); // an empty field name can never fire either (review 14, finding 4)
-    expect(reports.map((r) => r.key)).toEqual(["tasks/NaN", "tasks/", "tasks/project_id/ 1", "tasks//1"]);
-    expect(reports.every((r) => r.error instanceof TypeError && r.kind === "selector")).toBe(true);
-    expect(reporting.listenerCount()).toBe(0);
-    // listenerCount agrees with subscribe about what is invalid: 0, not a throw (review 14, finding 3)
-    expect(reporting.listenerCount({ objectType: "tasks", id: NaN })).toBe(0);
-    expect(reporting.listenerCount({ objectType: "tasks", keyName: "", key: 1 })).toBe(0);
-    // eventKey keeps throwing, for callers that want the exception
+    // subscribe and eventKey both throw for keys that can never fire (see the contract)
+    expect(() => bus.subscribe({ objectType: "tasks", id: NaN }, () => {})).toThrow(/finite number or non-empty string/);
     expect(() => eventKey({ objectType: "tasks", id: NaN })).toThrow(/finite number or non-empty string/);
+    expect(() => eventKey({ objectType: "tasks", keyName: 5 as never, key: 1 })).toThrow(/both keyName and key/); // a numeric field NAME is not a name
   });
 
   test("a custom index field is honoured and objects without an index value are skipped", async () => {
