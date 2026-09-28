@@ -89,17 +89,55 @@ describe("eventKey", () => {
     expect(eventKey({ objectType: "tasks", keyName: "project_id", key: 42 })).toBe("tasks/project_id/42");
   });
 
+  test("a selector that can never fire THROWS from subscribe, whatever the shape of the bad input (contract; review 15, finding 3)", () => {
+    const bus = new DataEventHandler();
+    const weird = [
+      // no usable objectType: null, a bare string, a symbol, empty, missing, inherited (review 16, findings 1–2)
+      null as never,
+      "tasks" as never,
+      { objectType: Symbol("t") as never },
+      { objectType: "" },
+      {} as never,
+      Object.create({ objectType: "tasks" }) as never,
+      { objectType: 7 as never },
+      // a bad id / key / field name
+      { objectType: "tasks", id: Object.create(null) as never },
+      { objectType: "tasks", id: { toString: () => { throw new Error("no"); } } as never },
+      { objectType: "tasks", id: NaN },
+      { objectType: "tasks", id: "" },
+      { objectType: "tasks", keyName: "", key: 1 }, // an empty field name can never fire either
+      { objectType: "tasks", keyName: "project_id", key: " 1" },
+    ];
+    for (const selector of weird) expect(() => bus.subscribe(selector, () => {})).toThrow(TypeError);
+    expect(bus.listenerCount()).toBe(0);
+    // listenerCount agrees: the same selectors throw there too, they can have no listeners by construction
+    expect(() => bus.listenerCount({ objectType: "tasks", id: NaN })).toThrow(TypeError);
+  });
+
+  test("selector fields are read as own properties, like data fields (review 15, finding 8)", async () => {
+    const bus = new DataEventHandler();
+    const seen: string[] = [];
+    // an inherited `id` is not part of the selector: this is a bucket subscription
+    const inherited = Object.assign(Object.create({ id: 7 }) as Record<string, unknown>, { objectType: "tasks" });
+    bus.subscribe(inherited as never, (b) => seen.push(b.key));
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 1 }, { id: 7 }] });
+    await tick();
+    expect(seen).toEqual(["tasks"]);
+    expect(eventKey(inherited as never)).toBe("tasks");
+  });
+
   test("defined values decide the shape; a lone undefined discriminator throws", () => {
     expect(eventKey({ objectType: "tasks", id: 7, keyName: undefined, key: undefined } as never)).toBe("tasks/7");
     expect(() => eventKey({ objectType: "tasks", id: undefined } as never)).toThrow(/undefined id/);
     expect(() => eventKey({ objectType: "tasks", keyName: "project_id", key: undefined } as never)).toThrow(/both keyName and key/);
     const bus = new DataEventHandler();
     expect(() => bus.subscribe({ objectType: "tasks", id: undefined as unknown as number }, () => {})).toThrow(TypeError);
+    expect(bus.listenerCount()).toBe(0);
   });
 
   test("selectors that would never fire throw: null or non-scalar id/key, and id together with a foreign key", () => {
     expect(() => eventKey({ objectType: "tasks", id: null } as never)).toThrow(/undefined id/);
-    expect(() => eventKey({ objectType: "tasks", id: {} } as never)).toThrow(/string or number id/);
+    expect(() => eventKey({ objectType: "tasks", id: {} } as never)).toThrow(/finite number or non-empty string id/);
     expect(() => eventKey({ objectType: "tasks", keyName: "project_id", key: {} } as never)).toThrow(/both keyName and key/);
     expect(() => eventKey({ objectType: "tasks", id: 7, keyName: "project_id", key: 1 } as never)).toThrow(/both an id and a foreign key/);
     expect(eventKey({ objectType: "tasks", id: 7, keyName: null, key: null } as never)).toBe("tasks/7");
@@ -181,6 +219,19 @@ describe("DataEventHandler", () => {
     expect(batches[0]!.ids).toEqual([7]);
   });
 
+  test("keys follow the shared rule: NaN, empty and padded ids are skipped on broadcast and refused on subscribe (review 5, finding 3)", async () => {
+    const bus = new DataEventHandler();
+    const ids: unknown[] = [];
+    bus.subscribe({ objectType: "tasks" }, (b) => ids.push(...b.ids));
+    bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: NaN }, { id: "" }, { id: " 1" }, { id: 2 }] });
+    await tick();
+    expect(ids).toEqual([2]);
+    // subscribe and eventKey both throw for keys that can never fire (see the contract)
+    expect(() => bus.subscribe({ objectType: "tasks", id: NaN }, () => {})).toThrow(/finite number or non-empty string/);
+    expect(() => eventKey({ objectType: "tasks", id: NaN })).toThrow(/finite number or non-empty string/);
+    expect(() => eventKey({ objectType: "tasks", keyName: 5 as never, key: 1 })).toThrow(/both keyName and key/); // a numeric field NAME is not a name
+  });
+
   test("a custom index field is honoured and objects without an index value are skipped", async () => {
     const bus = new DataEventHandler();
     const ids: unknown[] = [];
@@ -247,6 +298,56 @@ describe("DataEventHandler", () => {
       });
       await tick();
       expect(batches.map((b) => [b.key, b.ids])).toEqual([["tasks/project_id/42", [7]]]);
+    });
+
+    test("only OWN foreign-key fields count as present, like the write guard (review 8, finding 4)", async () => {
+      const bus = new DataEventHandler();
+      const keys: string[] = [];
+      bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => keys.push(b.key));
+      bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 43 }, (b) => keys.push(b.key));
+      // project_id inherited from the prototype: not a data field, so not "present" → the object stays in bucket 42
+      const object = Object.assign(Object.create({ project_id: 43 }) as Record<string, unknown>, { id: 7, title: "x" });
+      bus.broadcast({ objectType: "tasks", action: "update", objects: [object], previous: [{ id: 7, project_id: 42 }], foreignKeys: ["project_id"] });
+      await tick();
+      expect(keys).toEqual(["tasks/project_id/42"]);
+    });
+
+    test("the index is read as an OWN property too: an inherited or accessor id is not an id (review 9, finding 2)", async () => {
+      const bus = new DataEventHandler();
+      const ids: unknown[] = [];
+      bus.subscribe({ objectType: "tasks" }, (b) => ids.push(...b.ids));
+      const inherited = Object.assign(Object.create({ id: 7 }) as Record<string, unknown>, { title: "x" });
+      const accessor = Object.defineProperty({ title: "y" } as Record<string, unknown>, "id", { get: () => 8, enumerable: true });
+      const own = { id: 9 };
+      bus.broadcast({ objectType: "tasks", action: "add", objects: [inherited, accessor, own] });
+      await tick();
+      expect(ids).toEqual([8, 9]); // an accessor defined on the object itself is an own property; an inherited id is not
+    });
+
+    test("an own foreign key set to undefined means 'no value', like null: the object has LEFT its bucket (review 12, finding 2)", async () => {
+      // The cache replaces stored objects whole, so a written `undefined` is the new value.
+      for (const noValue of [undefined, null]) {
+        const bus = new DataEventHandler();
+        const keys: string[] = [];
+        bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => keys.push(`${b.key}:${b.ids.join(",")}`));
+        bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 43 }, (b) => keys.push(b.key));
+        bus.broadcast({
+          objectType: "tasks",
+          action: "update",
+          objects: [{ id: 7, project_id: noValue, title: "x" }],
+          previous: [{ id: 7, project_id: 42 }],
+          foreignKeys: ["project_id"],
+        });
+        await tick();
+        expect(keys).toEqual(["tasks/project_id/42:7"]); // the old bucket hears it left; no bucket gains it
+      }
+      // whereas a field that is not own at all is absent: the object stays where `previous` says
+      const bus = new DataEventHandler();
+      const keys: string[] = [];
+      bus.subscribe({ objectType: "tasks", keyName: "project_id", key: 42 }, (b) => keys.push(`${b.key}:${b.ids.join(",")}`));
+      bus.broadcast({ objectType: "tasks", action: "update", objects: [{ id: 7, title: "x" }], previous: [{ id: 7, project_id: 42 }], foreignKeys: ["project_id"] });
+      await tick();
+      expect(keys).toEqual(["tasks/project_id/42:7"]);
     });
 
     test("`previous` entries whose id is not in `objects` are ignored", async () => {

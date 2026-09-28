@@ -14,10 +14,12 @@ shapes, or the factories (step 11) are the place to adapt.
 | Base path | `/api/v1` |
 | Auth header | `Authorization: <uuid>:<token>` on every request except `sign_in` |
 | Unauthenticated | `401 {"error":"unauthorized"}` |
+| Authorization | reads are workspace-wide; **writes to a project's tasks require membership** of that project: `403 {"error":"not a member of this project"}`, decided after `404` and before any body check |
 | Not found | `404 {"error":"<thing> not found"}`; unknown `/api/*` paths are JSON 404, never the HTML fallback |
+| Server error | a route that throws answers `500 {"error":"internal error"}` (JSON, never the HTML fallback) and logs the exception |
 | Response shape | an object keyed by bucket name: lists `{ tasks: [...] }`, singles `{ task: {...} }` |
 | Embedded objects | `tasks` carry `assignee` (a public user or `null`); the client lifts it into the `users` bucket |
-| User representations | public users (`user`, `assignee`) carry `id`, `name`, `email` only; `current_user` additionally carries `settings` and is only ever sent to that user |
+| User representations | public users (`user`, `assignee`, `/users`) carry `id` and `name` only; `current_user` additionally carries `email` and `settings` and is only ever sent to that user |
 | Deletions | mutations may include `deleted_<bucket>: [ids]`; the client removes those ids |
 | Optimistic locking | `tasks` carry a `hash`; `PUT` must send the current one or gets `409 {"error":"conflict", task}` |
 | Validation | every write body is validated (`src/server/validation.ts`): unknown and server-owned fields are dropped, badly typed values return `400 {"error"}` and nothing is written or broadcast |
@@ -29,23 +31,25 @@ shapes, or the factories (step 11) are the place to adapt.
 |---|---|
 | `ada@example.com` | `password` |
 | `grace@example.com` | `password` |
+| `alan@example.com` | `password` (on no project; still a workspace member) |
 
 ## Endpoints
 
 | Method | Path | Body | Response | Push |
 |---|---|---|---|---|
-| POST | `/sign_in` | `{email, password}` (non-empty strings) | `{uuid, token, user}`, `400` on a bad body | — |
+| POST | `/sign_in` | `{email, password}` (non-empty strings) | `{uuid, token, user}` — `user` is the public `{id, name}`; the email is on `current_user` from `/users/current`. `400` on a bad body | — |
 | DELETE | `/sign_out` | — | `{ok: true}`; that session's sockets get `session_invalid` and close | — |
-| GET | `/users/current` | — | `{user, current_user}` (`current_user` carries `settings`) | — |
+| GET | `/users` | — | `{users: []}` — every workspace user as `id` and `name`; fills the `users` bucket so `owner_id`, `member_ids`, `assignee_id`, `author_id` always resolve. The demo is one workspace whose members see each other by name (the usual collaboration model); emails and settings never leave `current_user` | — |
+| GET | `/users/current` | — | `{user, current_user}` — `user` is the public `{id, name}` (for the `users` bucket); `current_user` adds `email` and `settings` | — |
 | PUT | `/users/current/settings` | `{settings}` (plain object) | `{current_user}` (settings merged), `400` otherwise | `update current_user` **to that user only** |
-| GET | `/projects` | — | `{projects: []}` | — |
-| GET | `/projects/:id` | — | `{project}` | — |
+| GET | `/projects` | — | `{projects: []}` (each with `owner_id`, `member_ids`) | — |
+| GET | `/projects/:id` | — | `{project}` (with `owner_id`, `member_ids`) | — |
 | GET | `/projects/:id/tasks` | — | `{tasks: []}` with embedded `assignee` | — |
-| POST | `/projects/:id/tasks` | `{task: {title, status?, assignee_id?, due_on?}}` | `201 {task}`, `400` on bad values (same rules as `PUT`) | `new task` |
-| POST | `/projects/:id/tasks/import` | — | `{imported: n}` **only a count** | `reload project` |
+| POST | `/projects/:id/tasks` | `{task: {title, status?, assignee_id?, due_on?}}` | `201 {task}`; `404`, `403` non-member, `400` on bad values (same rules as `PUT`); `assignee_id`, when given, must be a project member | `new task` |
+| POST | `/projects/:id/tasks/import` | — | `{imported: n}` **only a count**; `404`, `403` non-member. All or nothing: authorized once and every row validated before any is written | `reload project` (only if `n > 0`) |
 | GET | `/tasks/:id` | — | `{task}` with embedded `assignee` | — |
-| PUT | `/tasks/:id` | `{task: {hash, title?, status?, assignee_id?, due_on?}}` | `{task}` with new `hash`, `400` on bad values, or `409` | `update task` |
-| DELETE | `/tasks/:id` | — | `{deleted_tasks: [id], deleted_comments: [ids]}` | `delete task` |
+| PUT | `/tasks/:id` | `{task: {hash, title?, status?, assignee_id?, due_on?}}` | `{task}` with new `hash`. Decided in this order, atomically: `404` unknown task; `403` caller not on the task's project; `400` malformed (`task` is not an object or `hash` is not a non-empty string — a request without a usable hash is broken, not in conflict; server hashes are never empty); `409 {error, task}` stale hash, carrying the current task; `400` bad field values, or an `assignee_id` that *changes* to a user who is not a project member (saving a task back with its current assignee is always accepted, even if that user has since left the project) | `update task` |
+| DELETE | `/tasks/:id` | — | `{deleted_tasks: [id], deleted_comments: [ids]}`; `404`, `403` non-member | `delete task` |
 | GET | `/tasks/:id/comments` | — | `{comments: []}` | — |
 | GET | `/tasks/:id/tags` | — | `{tags: []}` (client synthesises join rows) | — |
 

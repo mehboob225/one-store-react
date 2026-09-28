@@ -46,20 +46,30 @@
  *    STORE ONCE AFTER SUBSCRIBING — the timestamp atoms do this on mount;
  *  - a throwing listener never stops the others;
  *  - a `flush()` requested from inside a flush runs after the current one,
- *    so batches are always delivered in the order they were queued.
+ *    so batches are always delivered in the order they were queued;
+ *  - a selector that can never fire (undefined/NaN/"" id or key, an empty
+ *    field name, half a foreign key) is a programming error and THROWS from
+ *    `subscribe` and `eventKey`. Subscribers are the timestamp atoms, whose
+ *    ids come from route params that the param hook validates first (step
+ *    14/16); a bad id reaching the bus must be loud, not a stale screen.
  */
+
+import { canonicalKey, hasField, isKeyValue, ownField } from "./canonicalKey";
 
 export type Unsubscribe = () => void;
 
-/** Called when a listener throws; the other listeners still run. */
-export type ListenerErrorHandler = (error: unknown, context: { key?: string }) => void;
+/** Context of a report: the key whose listener threw (absent for a plain EventHandler). */
+export type BusErrorContext = { key?: string };
+
+/** Called when a listener throws during delivery; the other listeners still run. The default logs to the console. */
+export type ListenerErrorHandler = (error: unknown, context: BusErrorContext) => void;
 
 const defaultErrorHandler: ListenerErrorHandler = (error, context) => {
   console.error(context.key ? `listener for "${context.key}" threw` : "listener threw", error);
 };
 
 /** Reports a listener error; a throwing custom handler must not escape delivery either. */
-function report(handler: ListenerErrorHandler, error: unknown, context: { key?: string }): void {
+function report(handler: ListenerErrorHandler, error: unknown, context: BusErrorContext): void {
   try {
     handler(error, context);
   } catch (handlerError) {
@@ -82,7 +92,7 @@ function deliver<P>(
   live: ReadonlySet<Entry<P>>,
   payload: P,
   onError: ListenerErrorHandler,
-  context: { key?: string },
+  context: BusErrorContext,
   snapshot: readonly Entry<P>[] = Array.from(live),
 ): void {
   for (const entry of snapshot) {
@@ -161,8 +171,9 @@ export type BroadcastInput =
    * `previous` is the pre-write state of `objects`, matched by index value
    * (unmatched entries are ignored). For each declared foreign key present in
    * the written object whose value changed, the old bucket is notified too.
-   * A foreign key absent from the written object (partial update) is
-   * unchanged and its bucket is taken from `previous`.
+   * A foreign key that is not an own property of the written object (a
+   * partial write) is unchanged and its bucket is taken from `previous`; an
+   * own `undefined` or `null` means the object has no value there.
    */
   | (BroadcastBase & { action: "update"; objects: readonly Row[]; previous: readonly Row[] })
   /** `objects` must be the STORED objects (with their foreign keys), never id-only stubs. */
@@ -183,24 +194,34 @@ type Resolved =
  * Subscribe conditionally instead.
  */
 function resolve(selector: DataEventSelector): Resolved {
-  const { objectType, id, keyName, key } = selector as { objectType: string; id?: unknown; keyName?: unknown; key?: unknown };
+  // Selector fields are read with the same own-property rule as data fields.
+  const fields = selector as unknown as Record<string, unknown>;
+  const objectType = ownField(fields, "objectType");
+  // A selector without a usable type could only ever be a bucket subscription that never fires.
+  if (typeof objectType !== "string" || objectType === "") {
+    throw new TypeError("eventKey: selector needs a non-empty string objectType");
+  }
+  const id = ownField(fields, "id");
+  const keyName = ownField(fields, "keyName");
+  const key = ownField(fields, "key");
   const hasId = id != null;
   const hasForeignKey = keyName != null || key != null;
   if (hasId && hasForeignKey) {
     throw new TypeError(`eventKey: selector for "${objectType}" has both an id and a foreign key; pick one`);
   }
   if (hasForeignKey) {
-    if (typeof keyName !== "string" || !isIndexValue(key)) {
-      throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key (a string or number)`);
+    if (typeof keyName !== "string" || !isKeyValue(keyName) || !isKeyValue(key)) {
+      throw new TypeError(`eventKey: selector for "${objectType}" needs both keyName and key (a finite number or non-empty string)`);
     }
-    const value = String(key);
+    const value = canonicalKey(key);
     return { kind: "fk", objectType, keyName, value, label: `${objectType}/${keyName}/${value}` };
   }
   if (hasId) {
-    if (!isIndexValue(id)) throw new TypeError(`eventKey: selector for "${objectType}" needs a string or number id`);
-    return { kind: "id", objectType, id: String(id), label: `${objectType}/${String(id)}` };
+    if (!isKeyValue(id)) throw new TypeError(`eventKey: selector for "${objectType}" needs a finite number or non-empty string id`);
+    const canon = canonicalKey(id);
+    return { kind: "id", objectType, id: canon, label: `${objectType}/${canon}` };
   }
-  if ("id" in selector || "key" in selector || "keyName" in selector) {
+  if (hasField(fields, "id") || hasField(fields, "key") || hasField(fields, "keyName")) {
     throw new TypeError(`eventKey: selector for "${objectType}" has an undefined id or key; use { objectType } for the bucket`);
   }
   return { kind: "bucket", objectType, label: objectType };
@@ -239,7 +260,8 @@ export class DataEventHandler {
 
   /** Subscribes to a selector (bucket, object, or foreign-key value). Each call is its own subscription. */
   subscribe(selector: DataEventSelector, listener: DataEventListener): Unsubscribe {
-    // Resolved once: unsubscribe must not re-read a selector the caller may have mutated since.
+    // Resolved once (and validated: a selector that can never fire throws here, see the contract
+    // above): unsubscribe must not re-read a selector the caller may have mutated since.
     const resolved = resolve(selector);
     const entry: Entry<DataEventBatch> = { listener };
     const target = this.targetFor(resolved, true)!;
@@ -268,9 +290,9 @@ export class DataEventHandler {
     const previousById = input.action === "update" && watchedForeignKeys.length > 0 ? indexById(input.previous, index) : undefined;
 
     for (const object of objects) {
-      const id = object[index];
-      if (!isIndexValue(id)) continue;
-      const canon = String(id);
+      const id = ownField(object, index);
+      if (!isKeyValue(id)) continue;
+      const canon = canonicalKey(id);
 
       if (type.bucket.size > 0) this.enqueue(type.bucket, objectType, objectType, id);
 
@@ -307,7 +329,7 @@ export class DataEventHandler {
 
   /** Number of listeners for a selector (or in total). Mostly for tests and diagnostics. */
   listenerCount(selector?: DataEventSelector): number {
-    if (selector) return this.targetFor(resolve(selector), false)?.size ?? 0;
+    if (selector) return this.targetFor(resolve(selector), false)?.size ?? 0; // throws for an invalid selector, like subscribe
     let total = 0;
     for (const type of this.types.values()) {
       total += type.bucket.size;
@@ -363,27 +385,28 @@ export class DataEventHandler {
   }
 
   /**
-   * Notifies the bucket the object is in now (or, for a partial update
-   * missing the field, the bucket `previous` says it is in) and — when the
-   * value changed — the bucket it left.
+   * Notifies the bucket the object is in now (or, when the field is not an
+   * own property of the write, the bucket `previous` says it is in) and —
+   * when the value changed — the bucket it left.
    */
   private enqueueForeignKey(values: Map<string, Target>, objectType: string, fk: string, id: IndexValue, object: Row, before: Row | undefined): void {
-    const present = fk in object;
-    const current = present ? object[fk] : before?.[fk];
+    const present = hasField(object, fk); // own property, whatever its value — the same meaning as the write guard
+    const current = present ? object[fk] : ownField(before, fk);
     this.enqueueForeignValue(values, objectType, fk, current, id);
 
     // Only a field present in the write can have moved the object out of its old bucket.
-    const old = present ? before?.[fk] : undefined;
-    if (isIndexValue(old) && (!isIndexValue(current) || String(old) !== String(current))) {
+    const old = present ? ownField(before, fk) : undefined;
+    if (isKeyValue(old) && (!isKeyValue(current) || canonicalKey(old) !== canonicalKey(current))) {
       this.enqueueForeignValue(values, objectType, fk, old, id);
     }
   }
 
   /** Queues `id` for the subscribers of `fk = value`, if `value` is a scalar somebody watches. */
   private enqueueForeignValue(values: Map<string, Target>, objectType: string, fk: string, value: unknown, id: IndexValue): void {
-    if (!isIndexValue(value)) return;
-    const target = values.get(String(value));
-    if (target) this.enqueue(target, `${objectType}/${fk}/${String(value)}`, objectType, id);
+    if (!isKeyValue(value)) return;
+    const canon = canonicalKey(value);
+    const target = values.get(canon);
+    if (target) this.enqueue(target, `${objectType}/${fk}/${canon}`, objectType, id);
   }
 
   /** Adds `id` to the target's pending batch and makes sure a flush is scheduled. */
@@ -393,7 +416,7 @@ export class DataEventHandler {
       entry = { key, objectType, ids: new Map() };
       this.pending.set(target, entry);
     }
-    const canon = String(id);
+    const canon = canonicalKey(id);
     if (!entry.ids.has(canon)) entry.ids.set(canon, id);
     this.scheduleFlush();
   }
@@ -443,12 +466,9 @@ function getOrCreate(map: Map<string, Target>, key: string, create: boolean): Ta
 function indexById(objects: readonly Row[], index: string): Map<string, Row> {
   const map = new Map<string, Row>();
   for (const object of objects) {
-    const id = object[index];
-    if (isIndexValue(id)) map.set(String(id), object);
+    const id = ownField(object, index);
+    if (isKeyValue(id)) map.set(canonicalKey(id), object);
   }
   return map;
 }
 
-function isIndexValue(value: unknown): value is IndexValue {
-  return typeof value === "number" || typeof value === "string";
-}

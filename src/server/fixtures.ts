@@ -7,10 +7,16 @@
  * The demo domain exists to exercise every ModelDefinitions property:
  *   users            plain bucket
  *   current_users    the logged-in user + settings
- *   projects         owner_id -> users, relatedObjectType tasks (cascade)
+ *   projects         owner_id -> users, member_ids -> users (foreignKeysArray),
+ *                    relatedObjectType tasks (cascade)
  *   tasks            project_id, assignee_id, embedded assignee, comments, tags
+ *                    (deleting a task also deletes its comments and tag links)
  *   comments         plain rows (no model class)
- *   tags + task_tags many-to-many
+ *   tags + task_tags many-to-many. The server table is `task_tags`; the client
+ *                    bucket is `task_tags_relation`, whose rows the client
+ *                    synthesises from GET /tasks/:id/tags and removes itself
+ *                    by cascade when a task or tag is deleted (the server never
+ *                    sends `deleted_task_tags*`).
  */
 
 export type TaskStatus = "todo" | "doing" | "done";
@@ -28,6 +34,8 @@ export interface ProjectRow {
   id: number;
   name: string;
   owner_id: number;
+  /** Users on the project (an id array: exercises `foreignKeysArray`). */
+  member_ids: number[];
   created_at: string;
 }
 
@@ -74,10 +82,12 @@ export function seed(): SeedData {
     users: [
       { id: 1, name: "Ada Lovelace", email: "ada@example.com", password: "password", settings: { theme: "dark" } },
       { id: 2, name: "Grace Hopper", email: "grace@example.com", password: "password", settings: {} },
+      // on no project, but a workspace member: visible by name like everyone else
+      { id: 3, name: "Alan Turing", email: "alan@example.com", password: "password", settings: {} },
     ],
     projects: [
-      { id: 1, name: "Analytical Engine", owner_id: 1, created_at: "2026-09-01T09:00:00Z" },
-      { id: 2, name: "COBOL Compiler", owner_id: 2, created_at: "2026-09-10T09:00:00Z" },
+      { id: 1, name: "Analytical Engine", owner_id: 1, member_ids: [1, 2], created_at: "2026-09-01T09:00:00Z" },
+      { id: 2, name: "COBOL Compiler", owner_id: 2, member_ids: [2, 1], created_at: "2026-09-10T09:00:00Z" }, // Ada: task 5 is hers
     ],
     tasks: [
       { id: 1, project_id: 1, assignee_id: 1, title: "Design the mill", status: "done", due_on: "2026-09-15", hash: "t1-1" },
