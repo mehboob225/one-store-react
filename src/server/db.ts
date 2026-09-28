@@ -14,7 +14,8 @@ import {
   type TaskTagRow,
   type UserRow,
 } from "./fixtures";
-import { MUTABLE_TASK_FIELDS, validateNewTask, validateTaskEnvelope, validateTaskFields, type MutableTaskField } from "./validation";
+import { hasField } from "../store/canonicalKey";
+import { MUTABLE_TASK_FIELDS, validateNewTask, validateTaskEnvelope, validateTaskFields, type MutableTaskField, type Validated } from "./validation";
 
 /** What other users may see: id and name only — never email, password or settings. */
 export type PublicUser = Pick<UserRow, "id" | "name">;
@@ -144,17 +145,11 @@ export class Database {
   }
 
   /**
-   * One authorization answer for writing to a project, for routes that need
-   * it before doing anything else (the import). Membership is the one rule
-   * for who may write to a project and who may be assigned its tasks. The
-   * owner is always a member (a seed invariant), so `member_ids` — and the
-   * client's `getMembers()` — is the complete list.
+   * Finds the project and checks membership, in that order, for every write.
+   * Membership is the one rule for who may write to a project and who may be
+   * assigned its tasks. The owner is always a member (a seed invariant), so
+   * `member_ids` — and the client's `getMembers()` — is the complete list.
    */
-  canWriteProject(projectId: number, actorId: number): "missing" | "forbidden" | "ok" {
-    return this.authorize(projectId, actorId).kind;
-  }
-
-  /** Finds the project and checks membership, in that order, for every write. */
   private authorize(projectId: number, actorId: number): Authorized {
     const project = this.data.projects.find((p) => p.id === projectId);
     if (!project) return { kind: "missing" };
@@ -195,11 +190,9 @@ export class Database {
   createTask(projectId: number, body: unknown, actorId: number): CreateOutcome {
     const access = this.authorize(projectId, actorId);
     if (access.kind !== "ok") return access;
-    const validated = validateNewTask(body);
-    if (!validated.ok) return { kind: "invalid", error: validated.error };
-    const input: NewTask = validated.value;
-    if (input.assignee_id != null && !isMember(access.project, input.assignee_id)) return { kind: "invalid", error: ASSIGNEE_RULE };
-    return { kind: "created", task: this.insertTask(access.project, input) };
+    const prepared = prepareNewTask(access.project, body);
+    if (!prepared.ok) return { kind: "invalid", error: prepared.error };
+    return { kind: "created", task: this.insertTask(access.project, prepared.value) };
   }
 
   /**
@@ -212,12 +205,9 @@ export class Database {
     if (access.kind !== "ok") return access;
     const inputs: NewTask[] = [];
     for (const body of bodies) {
-      const validated = validateNewTask(body);
-      if (!validated.ok) return { kind: "invalid", error: validated.error };
-      if (validated.value.assignee_id != null && !isMember(access.project, validated.value.assignee_id)) {
-        return { kind: "invalid", error: ASSIGNEE_RULE };
-      }
-      inputs.push(validated.value);
+      const prepared = prepareNewTask(access.project, body); // the same per-row rules as createTask
+      if (!prepared.ok) return { kind: "invalid", error: prepared.error };
+      inputs.push(prepared.value);
     }
     return { kind: "imported", tasks: inputs.map((input) => this.insertTask(access.project, input)) };
   }
@@ -249,13 +239,13 @@ export class Database {
     const validated = validateTaskFields(envelope.value.body);
     if (!validated.ok) return { kind: "invalid", error: validated.error };
     const fields = validated.value;
-    const assigneeChanged = Object.hasOwn(fields, "assignee_id") && fields.assignee_id !== task.assignee_id;
+    const assigneeChanged = hasField(fields, "assignee_id") && fields.assignee_id !== task.assignee_id;
     if (assigneeChanged && fields.assignee_id != null && !isMember(project, fields.assignee_id)) {
       return { kind: "invalid", error: ASSIGNEE_RULE };
     }
 
     for (const field of MUTABLE_TASK_FIELDS) {
-      if (field in fields) (task as Record<MutableTaskField, unknown>)[field] = fields[field];
+      if (hasField(fields, field)) (task as Record<MutableTaskField, unknown>)[field] = fields[field];
     }
     task.hash = bumpHash(task.hash);
     return { kind: "updated", task: clone(task) };
@@ -306,6 +296,14 @@ export class Database {
 /** The one membership rule, on a loaded project row. */
 function isMember(project: ProjectRow, userId: number): boolean {
   return project.member_ids.includes(userId);
+}
+
+/** The per-row rules shared by every create path: the body must validate and an assignee must be a member. */
+function prepareNewTask(project: ProjectRow, body: unknown): Validated<NewTask> {
+  const validated = validateNewTask(body);
+  if (!validated.ok) return validated;
+  if (validated.value.assignee_id != null && !isMember(project, validated.value.assignee_id)) return { ok: false, error: ASSIGNEE_RULE };
+  return validated;
 }
 
 /**

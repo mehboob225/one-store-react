@@ -313,9 +313,9 @@ describe("projects and tasks", () => {
     expect(mock.db.updateTask(1, "nope", 1)).toEqual({ kind: "invalid", error: "task must be an object" });
     expect(mock.db.updateTask(1, { hash: "t1-1" }, 3).kind).toBe("forbidden");
     expect(mock.db.deleteTask(1, 3).kind).toBe("forbidden");
-    expect(mock.db.canWriteProject(1, 3)).toBe("forbidden");
-    expect(mock.db.canWriteProject(2, 1)).toBe("ok");
-    expect(mock.db.canWriteProject(999, 1)).toBe("missing");
+    expect(mock.db.importTasks(1, [{ title: "x" }], 3).kind).toBe("forbidden");
+    expect(mock.db.importTasks(2, [{ title: "x" }], 1).kind).toBe("imported");
+    expect(mock.db.importTasks(999, [{ title: "x" }], 1).kind).toBe("missing");
   });
 
   test("an unchanged assignee never blocks an unrelated edit, even after that user left the project (review 11, finding 1)", async () => {
@@ -323,7 +323,7 @@ describe("projects and tasks", () => {
     const data = seed();
     data.projects.find((p) => p.id === 2)!.member_ids = [2];
     mock.db.reset(data);
-    expect(mock.db.canWriteProject(2, 1)).toBe("forbidden");
+    expect(mock.db.createTask(2, { title: "x" }, 1).kind).toBe("forbidden");
 
     const grace = await authHeaderFor("grace@example.com"); // still on project 2; Ada no longer is, so she may not write to it
     const put = (task: object) => api("/tasks/5", { method: "PUT", body: JSON.stringify({ task }) }, grace);
@@ -400,9 +400,9 @@ describe("projects and tasks", () => {
       expect(body.imported).toBe(3);
       expect(broadcasts).toEqual([{ type: "reload", objectType: "project", objectId: 2 }]);
 
-      // a rejected server-owned title is a server bug: 500, nothing written, nothing broadcast
+      // a rejected server-owned title is a server bug: 500 and no broadcast. (Whether anything was written is
+      // proven by the db-level test above; with importTasks stubbed, a count check here could not fail.)
       broadcasts.length = 0;
-      const count = mock.db.listTasks(2).length;
       mock.db.importTasks = () => ({ kind: "invalid", error: "stubbed" });
       const originalError = console.error;
       console.error = () => {}; // the server logs the deliberate exception; keep the runner output clean
@@ -414,7 +414,6 @@ describe("projects and tasks", () => {
         console.error = originalError;
       }
       expect(broadcasts).toEqual([]);
-      expect(mock.db.listTasks(2).length).toBe(count);
     } finally {
       mock.db.importTasks = originalImport;
       mock.push.broadcast = originalBroadcast;

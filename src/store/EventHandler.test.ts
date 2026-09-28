@@ -92,6 +92,15 @@ describe("eventKey", () => {
   test("a selector that can never fire THROWS from subscribe, whatever the shape of the bad input (contract; review 15, finding 3)", () => {
     const bus = new DataEventHandler();
     const weird = [
+      // no usable objectType: null, a bare string, a symbol, empty, missing, inherited (review 16, findings 1–2)
+      null as never,
+      "tasks" as never,
+      { objectType: Symbol("t") as never },
+      { objectType: "" },
+      {} as never,
+      Object.create({ objectType: "tasks" }) as never,
+      { objectType: 7 as never },
+      // a bad id / key / field name
       { objectType: "tasks", id: Object.create(null) as never },
       { objectType: "tasks", id: { toString: () => { throw new Error("no"); } } as never },
       { objectType: "tasks", id: NaN },
@@ -532,7 +541,7 @@ describe("DataEventHandler", () => {
       bus.broadcast({ objectType: "tasks", action: "add", objects: [{ id: 1 }] });
       await tick();
       expect(seen).toEqual(["tasks", "tasks/1"]);
-      expect((onError.mock.calls[0] as unknown[])[1]).toEqual({ kind: "listener", key: "tasks" });
+      expect((onError.mock.calls[0] as unknown[])[1]).toEqual({ key: "tasks" });
     });
   });
 

@@ -58,10 +58,10 @@ import { canonicalKey, hasField, isKeyValue, ownField } from "./canonicalKey";
 
 export type Unsubscribe = () => void;
 
-/** What the bus reports through its error handler: a listener threw during delivery (the others still run). */
-export type BusErrorContext = { kind: "listener"; key?: string };
+/** Context of a report: the key whose listener threw (absent for a plain EventHandler). */
+export type BusErrorContext = { key?: string };
 
-/** Receives every report; the default logs to the console. */
+/** Called when a listener throws during delivery; the other listeners still run. The default logs to the console. */
 export type ListenerErrorHandler = (error: unknown, context: BusErrorContext) => void;
 
 const defaultErrorHandler: ListenerErrorHandler = (error, context) => {
@@ -121,7 +121,7 @@ export class EventHandler<T> {
 
   /** Calls every listener synchronously (see the delivery contract above). */
   emit(payload: T): void {
-    deliver(this.entries, payload, this.onListenerError, { kind: "listener" });
+    deliver(this.entries, payload, this.onListenerError, {});
   }
 
   get size(): number {
@@ -196,7 +196,11 @@ type Resolved =
 function resolve(selector: DataEventSelector): Resolved {
   // Selector fields are read with the same own-property rule as data fields.
   const fields = selector as unknown as Record<string, unknown>;
-  const objectType = String(ownField(fields, "objectType"));
+  const objectType = ownField(fields, "objectType");
+  // A selector without a usable type could only ever be a bucket subscription that never fires.
+  if (typeof objectType !== "string" || objectType === "") {
+    throw new TypeError("eventKey: selector needs a non-empty string objectType");
+  }
   const id = ownField(fields, "id");
   const keyName = ownField(fields, "keyName");
   const key = ownField(fields, "key");
@@ -437,7 +441,7 @@ export class DataEventHandler {
         objectType: entry.objectType,
         ids: Object.freeze([...entry.ids.values()]),
       });
-      deliver(target, batch, this.onListenerError, { kind: "listener", key: entry.key }, snapshot);
+      deliver(target, batch, this.onListenerError, { key: entry.key }, snapshot);
     }
   }
 
