@@ -700,7 +700,22 @@ export function invalidForeignKeyFields(objectType: string, record: Record<strin
 
 /** The one implementation behind both overload sets; `definitions` undefined means the built-in schema. */
 function findInvalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition> | undefined): readonly string[] {
-  const facts = factsOf(objectType, definitions);
+  return invalidFieldsFor(factsOf(objectType, definitions), objectType, record);
+}
+
+/**
+ * The write guard bound to one type, for a bucket that checks every record it
+ * stores: the facts are resolved once (from the precomputed table when the
+ * map is the built-in one), not on every record. The map is read once, so a
+ * bucket must be rebuilt if its map is replaced — which is what `DataCache`
+ * does (step 8).
+ */
+export function foreignKeyGuard(objectType: string, definitions: Record<string, ModelDefinition>): (record: Record<string, unknown>) => readonly string[] {
+  const facts = factsOf(objectType, definitions === ModelDefinitions ? undefined : definitions);
+  return (record) => invalidFieldsFor(facts, objectType, record);
+}
+
+function invalidFieldsFor(facts: TypeFacts, objectType: string, record: Record<string, unknown>): readonly string[] {
   if (!isRecord(record)) throw new TypeError(`${objectType} record must be an object`);
   // no closure and no array on the clean path: `bad` is created by the first problem
   let bad: string[] | undefined;
