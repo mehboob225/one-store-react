@@ -120,8 +120,12 @@ export function createRoutes(ctx: RouteContext) {
       }),
       POST: authed<"/api/v1/projects/:id/tasks">(async (req, userId) => {
         const projectId = Number(req.params.id);
+        // 404/403 are answered BEFORE the body is read, so a refused request never buffers a large body.
+        const access = db.writeAccess(projectId, userId);
+        if (access === "missing") return notFound("project");
+        if (access === "forbidden") return forbidden();
         const body = await json<{ task?: unknown }>(req);
-        // The db authorizes, validates and applies the assignee rule itself: 404, 403, 400, then the write.
+        // The db authorizes again, validates and applies the assignee rule itself, atomically: 404, 403, 400, then the write.
         const outcome = db.createTask(projectId, body?.task, userId);
         switch (outcome.kind) {
           case "missing":
@@ -176,6 +180,10 @@ export function createRoutes(ctx: RouteContext) {
       }),
       PUT: authed<"/api/v1/tasks/:id">(async (req, userId) => {
         const id = Number(req.params.id);
+        // 404/403 before the body is read, as for POST above.
+        const access = db.taskWriteAccess(id, userId);
+        if (access === "missing") return notFound("task");
+        if (access === "forbidden") return forbidden();
         const body = await json<{ task?: unknown }>(req);
         // The db decides everything in one atomic step, in the documented order
         // (docs/API.md): 404, 403, 400 malformed, 409 with the current task, 400 bad values.

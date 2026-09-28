@@ -177,6 +177,23 @@ export class Database {
     return this.data.projects.some((p) => p.id === id);
   }
 
+  /**
+   * The 404/403 answer for a write to a project, WITHOUT the write. Routes
+   * call it before reading the request body, so a missing project or a
+   * non-member is refused before a large body is buffered and parsed. The
+   * write itself (`createTask`, `importTasks`) re-runs `authorize`
+   * atomically; this is only the early exit, never the decision.
+   */
+  writeAccess(projectId: number, actorId: number): Authorized["kind"] {
+    return this.authorize(projectId, actorId).kind;
+  }
+
+  /** `writeAccess` for a task's project: `missing` for an unknown task, then the project rule. */
+  taskWriteAccess(taskId: number, actorId: number): Authorized["kind"] {
+    const task = this.data.tasks.find((t) => t.id === taskId);
+    return task ? this.authorize(task.project_id, actorId).kind : "missing";
+  }
+
   hasTask(id: number): boolean {
     return this.data.tasks.some((t) => t.id === id);
   }
@@ -314,17 +331,36 @@ function assertSeedInvariants(data: SeedData): void {
   const fail = (message: string) => {
     throw new Error(`seed invariant: ${message}`);
   };
-  const projects = new Map(data.projects.map((p) => [p.id, p]));
-  const taskIds = new Set(data.tasks.map((t) => t.id));
-  const tagIds = new Set(data.tags.map((t) => t.id));
-  const userIds = new Set(data.users.map((u) => u.id));
+  // Ids are unique per table: every rule below, and every read/write in the
+  // class, resolves a row by the first id match, so a duplicate would be
+  // listed but unreachable.
+  const uniqueIds = (table: keyof SeedData, ids: readonly number[]): Set<number> => {
+    const seen = new Set<number>();
+    for (const id of ids) {
+      if (seen.has(id)) fail(`${table} id ${id} is listed twice`);
+      seen.add(id);
+    }
+    return seen;
+  };
+  const userIds = uniqueIds("users", data.users.map((u) => u.id));
+  const projectIds = uniqueIds("projects", data.projects.map((p) => p.id));
+  const taskIds = uniqueIds("tasks", data.tasks.map((t) => t.id));
+  const tagIds = uniqueIds("tags", data.tags.map((t) => t.id));
+  uniqueIds("comments", data.comments.map((c) => c.id));
+  const links = new Set<string>();
+  for (const link of data.task_tags) {
+    const key = `${link.task_id}-${link.tag_id}`;
+    if (links.has(key)) fail(`task_tags link ${key} is listed twice`);
+    links.add(key);
+  }
 
   for (const project of data.projects) {
     if (!project.member_ids.includes(project.owner_id)) fail(`project ${project.id} owner ${project.owner_id} must be in member_ids`);
+    if (new Set(project.member_ids).size !== project.member_ids.length) fail(`project ${project.id} lists a member twice`);
     for (const id of project.member_ids) if (!userIds.has(id)) fail(`project ${project.id} member ${id} is not a user`);
   }
   for (const task of data.tasks) {
-    if (!projects.has(task.project_id)) fail(`task ${task.id} belongs to missing project ${task.project_id}`);
+    if (!projectIds.has(task.project_id)) fail(`task ${task.id} belongs to missing project ${task.project_id}`);
     if (task.assignee_id !== null && !userIds.has(task.assignee_id)) fail(`task ${task.id} assignee ${task.assignee_id} is not a user`);
     // deliberately NOT asserted: assignee ∈ members. The write rule applies to a CHANGED assignee only,
     // so a task may keep an assignee who has since left the project (docs/API.md).

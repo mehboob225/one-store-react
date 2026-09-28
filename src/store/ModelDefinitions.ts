@@ -43,7 +43,7 @@
  * The exported map is deep-frozen; `definitionFor` returns a readonly view.
  */
 
-import { hasField, isKeyValue, ownField } from "./canonicalKey";
+import { hasField, isKeyValue, isRecord, ownField } from "./canonicalKey";
 
 export interface ForeignKeyDefinition {
   /** The bucket the value points at. */
@@ -302,10 +302,6 @@ function isEmittable(name: unknown): name is string {
   return typeof name === "string" && IDENTIFIER.test(name) && !RESERVED.has(name);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
 /**
  * A `__proto__` key in an object literal sets the prototype instead of adding
  * an entry, so the entry vanishes before validation can see it. Detect the
@@ -442,7 +438,7 @@ function collectFields(ctx: TypeContext): void {
  * identifier, must not collide with a data field of the same class, and must
  * be unique among the type's members.
  */
-function claimMember(ctx: TypeContext, kind: "getter" | "relation name" | "metaData key", name: unknown, owner: string): void {
+function claimMember(ctx: TypeContext, kind: "getter" | "relation name" | "key", name: unknown, owner: string): void {
   if (typeof name !== "string") {
     problem(ctx, `${owner} ${kind} is missing or not a string`);
     return;
@@ -521,7 +517,7 @@ function checkRelatedObjectTypes(ctx: TypeContext): void {
     if (!childFk) {
       problem(ctx, `${label}.key "${rel.key}" is not declared in ${rel.objectType}.foreignKeys (grouped index + events need it)`);
     } else if (childFk.objectType !== ctx.type) {
-      problem(ctx, `${label}.key "${rel.key}" points at ${childFk.objectType}, not ${ctx.type}`);
+      problem(ctx, `${label}.key "${rel.key}" points at ${String(childFk.objectType)}, not ${ctx.type}`);
     }
   }
 }
@@ -578,7 +574,7 @@ function checkJoinKey(ctx: TypeContext, label: string, throughType: string, thro
   if (fk !== undefined && !isRecord(fk)) return; // a mistyped entry is reported by the join type's own check
   if (!fk) problem(ctx, `${label}: ${throughType} does not declare foreignKeys.${key}`);
   else if (expected !== undefined && fk.objectType !== expected) {
-    problem(ctx, `${label}: ${throughType}.${key} points at ${fk.objectType}, not ${expected}`);
+    problem(ctx, `${label}: ${throughType}.${key} points at ${String(fk.objectType)}, not ${expected}`);
   }
 }
 
@@ -630,7 +626,7 @@ function checkMetaData(ctx: TypeContext): void {
       problem(ctx, `metaData lists "${key}" twice`);
     } else {
       seen.add(key);
-      claimMember(ctx, "metaData key", key, "metaData"); // the generator emits an accessor per key
+      claimMember(ctx, "key", key, `metaData.${key}`); // the generator emits an accessor per key
     }
   }
 }
@@ -699,6 +695,11 @@ const NO_BAD_FIELDS: readonly string[] = Object.freeze([]);
 export function invalidForeignKeyFields(objectType: ObjectType, record: Record<string, unknown>): readonly string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): readonly string[];
 export function invalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): readonly string[] {
+  return findInvalidForeignKeyFields(objectType, record, definitions);
+}
+
+/** The one implementation behind both overload sets; `definitions` undefined means the built-in schema. */
+function findInvalidForeignKeyFields(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition> | undefined): readonly string[] {
   const facts = factsOf(objectType, definitions);
   if (!isRecord(record)) throw new TypeError(`${objectType} record must be an object`);
   // no closure and no array on the clean path: `bad` is created by the first problem
@@ -724,7 +725,7 @@ function addUnique(list: string[] | undefined, item: string): string[] {
 export function assertForeignKeyValues(objectType: ObjectType, record: Record<string, unknown>): void;
 export function assertForeignKeyValues(objectType: string, record: Record<string, unknown>, definitions: Record<string, ModelDefinition>): void;
 export function assertForeignKeyValues(objectType: string, record: Record<string, unknown>, definitions?: Record<string, ModelDefinition>): void {
-  const bad = definitions === undefined ? invalidForeignKeyFields(objectType as ObjectType, record) : invalidForeignKeyFields(objectType, record, definitions);
+  const bad = findInvalidForeignKeyFields(objectType, record, definitions);
   if (bad.length > 0) {
     throw new TypeError(
       `${objectType} record has invalid index/foreign key value(s): ${bad.join(", ")} ` +

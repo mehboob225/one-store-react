@@ -6,7 +6,7 @@
  * fields are dropped; badly typed values are rejected before anything is
  * written or broadcast.
  */
-import { hasField, ownField } from "../store/canonicalKey";
+import { hasField, isRecord, ownField } from "../store/canonicalKey";
 import type { NewTask, TaskFields } from "./db";
 import type { TaskRow } from "./fixtures";
 
@@ -20,10 +20,6 @@ export const TASK_STATUSES: readonly TaskRow["status"][] = ["todo", "doing", "do
 /** The only task fields a client may set. `id`, `project_id`, `hash` are server-owned. */
 export const MUTABLE_TASK_FIELDS = ["title", "status", "assignee_id", "due_on"] as const;
 export type MutableTaskField = (typeof MUTABLE_TASK_FIELDS)[number];
-
-export function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
 
 function validateTaskField(field: MutableTaskField, value: unknown): string | undefined {
   switch (field) {
@@ -53,7 +49,7 @@ function collectTaskFields(body: Record<string, unknown>, target: Record<string,
 
 /** `POST /projects/:id/tasks` body (`task`): title required, other fields optional. */
 export function validateNewTask(input: unknown): Validated<NewTask> {
-  if (!isPlainObject(input)) return fail("task must be an object");
+  if (!isRecord(input)) return fail("task must be an object");
   if (!hasField(input, "title")) return fail("task.title is required");
   const value: Record<string, unknown> = {};
   const problem = collectTaskFields(input, value);
@@ -62,14 +58,16 @@ export function validateNewTask(input: unknown): Validated<NewTask> {
 
 /**
  * `PUT /tasks/:id` body (`task`), step one — the envelope: an object carrying
- * a string `hash`. Checked BEFORE the hash comparison, so a request without a
- * hash is reported as malformed (400), never as a conflict. Returns the
+ * a non-empty string `hash` (server hashes are never empty, so an empty one
+ * can only be a broken request). Checked BEFORE the hash comparison, so a
+ * request without a usable hash is reported as malformed (400), never as a
+ * conflict. Returns the
  * narrowed body so the field step needs no cast.
  */
 export function validateTaskEnvelope(input: unknown): Validated<{ hash: string; body: Record<string, unknown> }> {
-  if (!isPlainObject(input)) return fail("task must be an object");
+  if (!isRecord(input)) return fail("task must be an object");
   const hash = ownField(input, "hash");
-  if (typeof hash !== "string") return fail("task.hash must be a string");
+  if (typeof hash !== "string" || hash === "") return fail("task.hash must be a non-empty string");
   return ok({ hash, body: input });
 }
 
@@ -86,12 +84,12 @@ export function validateTaskFields(input: Record<string, unknown>): Validated<Ta
 
 /** `PUT /users/current/settings` body (`settings`): a plain object of preferences. */
 export function validateSettings(input: unknown): Validated<Record<string, unknown>> {
-  return isPlainObject(input) ? ok({ ...input }) : fail("settings must be an object");
+  return isRecord(input) ? ok({ ...input }) : fail("settings must be an object");
 }
 
 /** `POST /sign_in` body. */
 export function validateCredentials(input: unknown): Validated<{ email: string; password: string }> {
-  if (!isPlainObject(input)) return fail("body must be an object");
+  if (!isRecord(input)) return fail("body must be an object");
   const email = ownField(input, "email");
   const password = ownField(input, "password");
   if (typeof email !== "string" || email === "" || typeof password !== "string" || password === "") {

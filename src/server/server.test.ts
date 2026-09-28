@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { seed } from "./fixtures";
 import { createMockServer, type MockServer } from "./index";
+import { createRoutes } from "./routes";
 
 let mock: MockServer;
 let base: string;
@@ -275,11 +276,12 @@ describe("projects and tasks", () => {
       expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task }) }, alan)).status).toBe(403);
     }
     expect((await api("/tasks/999", { method: "PUT", body: JSON.stringify({ task: {} }) }, alan)).status).toBe(404); // 404 still first
-    // 3. malformed: no task object, or no string hash — a broken request, never a conflict
+    // 3. malformed: no task object, or no usable hash — a broken request, never a conflict
     for (const [task, message] of [
-      [{}, "task.hash must be a string"],
-      [{ hash: 5 }, "task.hash must be a string"],
-      [{ status: "done" }, "task.hash must be a string"],
+      [{}, "task.hash must be a non-empty string"],
+      [{ hash: 5 }, "task.hash must be a non-empty string"],
+      [{ hash: "" }, "task.hash must be a non-empty string"], // server hashes are never empty (review 16, finding 3)
+      [{ status: "done" }, "task.hash must be a non-empty string"],
       ["nope", "task must be an object"],
       [null, "task must be an object"],
     ] as const) {
@@ -356,7 +358,38 @@ describe("projects and tasks", () => {
     expect((await api("/projects/1/tasks", { method: "POST", body: JSON.stringify({ task: { title: "x" } }) })).status).toBe(201);
   });
 
-  test("seed invariants are asserted at load: owner membership and every reference (review 13 finding 3, review 14 finding 1)", () => {
+  test("a refused POST or PUT is answered before its body is read (review 16, finding 4)", async () => {
+    // Bun's Request constructor consumes a stream body eagerly, so this is observed
+    // at the handler: the routes are built on the live backend and called with a
+    // request whose `json()` records whether it was ever invoked.
+    const routes = createRoutes({ db: mock.db, sessions: mock.sessions, push: mock.push });
+    const send = async (handler: (req: never) => Response | Promise<Response>, id: string, headers: Record<string, string>) => {
+      let read = false;
+      const req = {
+        params: { id },
+        headers: new Headers(headers),
+        json: async () => {
+          read = true;
+          return { task: { title: "x", hash: "t1-1" } };
+        },
+      };
+      const res = await handler(req as never);
+      return { status: res.status, read };
+    };
+    const post = routes["/api/v1/projects/:id/tasks"].POST;
+    const put = routes["/api/v1/tasks/:id"].PUT;
+    const alan = await authHeaderFor("alan@example.com"); // on no project
+    const ada = await authHeader();
+    expect(await send(post, "999", ada)).toEqual({ status: 404, read: false });
+    expect(await send(post, "1", alan)).toEqual({ status: 403, read: false });
+    expect(await send(put, "999", ada)).toEqual({ status: 404, read: false });
+    expect(await send(put, "1", alan)).toEqual({ status: 403, read: false });
+    // an accepted request does read it (the control: the probe can observe a read)
+    expect(await send(post, "1", ada)).toEqual({ status: 201, read: true });
+    expect(await send(put, "1", ada)).toEqual({ status: 200, read: true });
+  });
+
+  test("seed invariants are asserted at load: owner membership, every reference and id uniqueness (reviews 13, 14, 16)", () => {
     const broken = (mutate: (d: ReturnType<typeof seed>) => void) => {
       const data = seed();
       mutate(data);
@@ -370,6 +403,14 @@ describe("projects and tasks", () => {
     expect(broken((d) => d.comments.push({ id: 99, task_id: 42, author_id: 1, body: "x", created_at: "" }))).toThrow(/comment 99 belongs to missing task 42/);
     expect(broken((d) => d.task_tags.push({ task_id: 1, tag_id: 42 }))).toThrow(/task_tags link 1-42 references a missing row/);
     expect(broken((d) => d.projects[0]!.member_ids.push(42))).toThrow(/project 1 member 42 is not a user/);
+    // ids are unique per table, and a member is listed once (review 16, finding 2)
+    expect(broken((d) => d.tasks.push({ ...d.tasks[0]!, project_id: 2 }))).toThrow(/tasks id 1 is listed twice/);
+    expect(broken((d) => d.users.push({ ...d.users[0]! }))).toThrow(/users id 1 is listed twice/);
+    expect(broken((d) => d.projects.push({ ...d.projects[0]! }))).toThrow(/projects id 1 is listed twice/);
+    expect(broken((d) => d.tags.push({ ...d.tags[0]! }))).toThrow(/tags id 1 is listed twice/);
+    expect(broken((d) => d.comments.push({ ...d.comments[0]! }))).toThrow(/comments id 1 is listed twice/);
+    expect(broken((d) => d.task_tags.push({ ...d.task_tags[0]! }))).toThrow(/task_tags link 1-1 is listed twice/);
+    expect(broken((d) => d.projects[0]!.member_ids.push(d.projects[0]!.owner_id))).toThrow(/project 1 lists a member twice/);
     // NOT an invariant: an assignee who has left the project (the write rule applies to a changed assignee only)
     expect(broken((d) => (d.projects.find((p) => p.id === 2)!.member_ids = [2]))).not.toThrow();
     mock.db.reset(); // back to a valid seed for the next test

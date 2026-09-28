@@ -18,7 +18,7 @@ import {
   type ObjectType,
   type RelatedObjectTypeDefinition,
 } from "./ModelDefinitions";
-import { canonicalKey } from "./canonicalKey";
+import { canonicalKey, isKeyValue, isRecord } from "./canonicalKey";
 
 describe("the real ModelDefinitions", () => {
   test("are internally consistent", () => {
@@ -612,9 +612,49 @@ describe("validateModelDefinitions", () => {
         things: { index: "id", foreignKeys: { owner_id: { objectType: "users", getter: "getOwner" } }, metaData: ["getOwner", "owner_id", "limits"] },
       }),
     ).toEqual([
-      'things: member "getOwner" is declared by both foreignKeys.owner_id and metaData',
-      'things: metaData metaData key "owner_id" collides with the data field declared by foreignKeys.owner_id',
+      'things: member "getOwner" is declared by both foreignKeys.owner_id and metaData.getOwner',
+      'things: metaData.owner_id key "owner_id" collides with the data field declared by foreignKeys.owner_id',
     ]);
+    expect(withDefs({ things: { index: "id", metaData: ["id"] } })).toEqual([
+      'things: metaData.id key "id" is a reserved name',
+      'things: metaData.id key "id" collides with the data field declared by index',
+    ]);
+  });
+
+  test("a Symbol objectType reached through a reference is reported, not thrown (review 16, finding 1)", () => {
+    // the child's own pointer check reports the symbol; the parent's key check must not throw on it
+    const symbol = Symbol("users") as unknown as string;
+    expect(
+      withDefs({
+        people: { index: "id", relatedObjectType: { tasks: { objectType: "tasks", key: "owner_id", getter: "getTasks" } } },
+        tasks: { index: "id", foreignKeys: { owner_id: { objectType: symbol, getter: "getOwner" } } },
+      }),
+    ).toEqual([
+      'people: relatedObjectType.tasks.key "owner_id" points at Symbol(users), not people',
+      'tasks: foreignKeys.owner_id points at unknown type "Symbol(users)"',
+    ]);
+    // the same through a hasMany join key
+    expect(
+      withDefs({
+        tasks: {
+          index: "id",
+          hasMany: { tags: { objectType: "tags", through: "links", thisKey: "task_id", otherKey: "tag_id", getter: "getTags" } },
+        },
+        tags: { index: "id" },
+        links: { index: "id", belongsTo: ["tasks"], foreignKeys: { task_id: { objectType: symbol, getter: "getTask" }, tag_id: { objectType: "tags", getter: "getTag" } } },
+      }),
+    ).toEqual([
+      'tasks: hasMany.tags: links.task_id points at Symbol(users), not tasks',
+      'links: foreignKeys.task_id points at unknown type "Symbol(users)"',
+    ]);
+  });
+
+  test("the schema validator and the server's body validators share one record predicate (review 16, finding 5)", () => {
+    for (const notRecord of [null, undefined, [], "x", 1, true]) expect(isRecord(notRecord)).toBe(false);
+    expect(isRecord({})).toBe(true);
+    expect(isRecord(Object.create(null))).toBe(true);
+    // a definitions map that is an array is not a record, exactly as a request body that is an array is not
+    expect(validateModelDefinitions([] as unknown as Record<string, ModelDefinition>)).toEqual(["definitions must be an object"]);
   });
 
   test("the write guard throws its own clear error for a non-object record (review 10, finding 3)", () => {
@@ -679,8 +719,7 @@ describe("validateModelDefinitions", () => {
     expect(invalidForeignKeyFields("things", { id: 1 }, defs)).toEqual([]);
   });
 
-  test("the event bus and the write guard share one key rule (review 5, finding 3)", async () => {
-    const { isKeyValue } = await import("./canonicalKey");
+  test("the event bus and the write guard share one key rule (review 5, finding 3)", () => {
     for (const bad of [NaN, Infinity, "", " 1", "1 "]) {
       expect(isKeyValue(bad)).toBe(false);
       expect(isForeignKeyValue(bad)).toBe(false);
