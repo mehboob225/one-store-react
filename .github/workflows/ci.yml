@@ -18,6 +18,9 @@ jobs:
       - name: Install
         run: bun install --frozen-lockfile
 
+      - name: Generated files are up to date
+        run: bun run generate-models --check
+
       - name: Typecheck
         run: bun run check
 

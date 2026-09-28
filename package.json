@@ -7,6 +7,7 @@
     "dev": "bun --hot src/index.ts",
     "check": "tsc --noEmit",
     "test": "bun test",
+    "generate-models": "bun scripts/generate-models.ts",
     "build": "bun build ./src/index.html --outdir=dist --sourcemap --target=browser --minify --define:process.env.NODE_ENV='\"production\"' --env='BUN_PUBLIC_*'",
     "start": "NODE_ENV=production bun src/index.ts"
   },

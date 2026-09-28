@@ -15,6 +15,9 @@ Each step is one PR; every PR must keep `bun run check`, `bun test` and
 - `bun dev` — hot-reloading dev server (`src/index.ts` serves `src/index.html` and the
   in-memory mock backend from `src/server/`; contract in `docs/API.md`)
 - `bun run check` — `tsc --noEmit`
+- `bun run generate-models` — regenerates `src/store/DataCache.ts` and `src/models/appdata/*AppData.ts`
+  from `ModelDefinitions` (`--check` fails on stale output; CI runs it). Generated files are committed
+  and never edited by hand.
 - `bun test` — unit + component tests (happy-dom is preloaded via `test/setup.ts`)
 - `bun run build` — static production build to `dist/`
 
@@ -39,6 +42,10 @@ only by the tab that performs the transition. Persisted UI state must use that p
 - Components never fetch and never hold server state; they declare loaders and read the store.
 - Atoms never fetch; they subscribe to store events and re-read inside `useMemo`.
 - Every factory method ends in a store write (`saveAppData` / `deleteAppData`).
+- Model classes extend their generated `*AppData` base and declare fields with `declare` (the base
+  constructor assigns the JSON; a plain field would reset it to `undefined`).
+- A model's accessors resolve through the store that holds it (`storeOf(model)`, set when a bucket
+  stores it); nothing under `src/models` imports `AppDataFactory`.
 
 ---
 
