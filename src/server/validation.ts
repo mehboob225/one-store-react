@@ -6,6 +6,7 @@
  * fields are dropped; badly typed values are rejected before anything is
  * written or broadcast.
  */
+import { isCalendarDate } from "../models/calendarDate";
 import { hasField, isRecord, ownField } from "../store/canonicalKey";
 import type { NewTask, TaskFields } from "./db";
 import type { TaskRow } from "./fixtures";
@@ -32,7 +33,7 @@ function validateTaskField(field: MutableTaskField, value: unknown): string | un
     case "assignee_id":
       return value === null || typeof value === "number" ? undefined : "task.assignee_id must be a number or null";
     case "due_on":
-      return value === null || typeof value === "string" ? undefined : "task.due_on must be a string or null";
+      return value === null || isCalendarDate(value) ? undefined : "task.due_on must be a YYYY-MM-DD date or null";
   }
 }
 

@@ -4,8 +4,8 @@ import { TagModelAppData } from "./appdata/TagModelAppData";
 export class TagModel extends TagModelAppData {
   declare name: string;
 
-  /** Case-insensitive substring match, for a tag picker's filter box. An empty query matches every tag. */
+  /** Case-insensitive substring match, for a tag picker's filter box. An empty query matches every tag, even a nameless one. */
   matches(query: string): boolean {
-    return this.name.toLowerCase().includes(query.trim().toLowerCase());
+    return (this.name ?? "").toLowerCase().includes(query.trim().toLowerCase());
   }
 }

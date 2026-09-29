@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { DataCache } from "../store/DataCache";
 import { ModelFactory } from "../store/AppDataModelFactory";
+import { isCalendarDate, localCalendarDate } from "./calendarDate";
 import { CurrentUserModel } from "./CurrentUserModel";
 import { ProjectModel } from "./ProjectModel";
 import { TagModel } from "./TagModel";
@@ -13,6 +14,7 @@ describe("UserModel", () => {
     expect(new UserModel({ id: 1, name: "  grace   brewster hopper " }).initials()).toBe("GB");
     expect(new UserModel({ id: 1, name: "plato" }).initials()).toBe("P");
     expect(new UserModel({ id: 1, name: "" }).initials()).toBe("");
+    expect(new UserModel({ id: 1 }).initials()).toBe(""); // a partial record renders, it does not throw
   });
 });
 
@@ -60,6 +62,10 @@ describe("TaskModel", () => {
     expect(task({ due_on: null }).isOverdue(oct1)).toBe(false);
   });
 
+  test("a due_on that is not a calendar date is no due date, never overdue (it would sort before every real date)", () => {
+    for (const due_on of ["", "soon", "2026-9-1", "2026-02-30", 20260901, undefined]) expect(task({ due_on }).isOverdue(oct1)).toBe(false);
+  });
+
   test("a done task is never overdue", () => {
     expect(task({ status: "done", due_on: "2026-01-01" }).isDone()).toBe(true);
     expect(task({ status: "done", due_on: "2026-01-01" }).isOverdue(oct1)).toBe(false);
@@ -74,5 +80,21 @@ describe("TagModel", () => {
     expect(tag.matches(" GENT ")).toBe(true);
     expect(tag.matches("")).toBe(true);
     expect(tag.matches("ui")).toBe(false);
+    expect(new TagModel({ id: 2 }).matches("")).toBe(true); // a nameless tag does not throw
+    expect(new TagModel({ id: 2 }).matches("a")).toBe(false);
+  });
+});
+
+describe("calendarDate", () => {
+  test("isCalendarDate accepts real YYYY-MM-DD days only", () => {
+    for (const good of ["2026-09-29", "2024-02-29", "2000-02-29", "0001-01-01", "2026-12-31"]) expect(isCalendarDate(good)).toBe(true);
+    for (const bad of ["", " 2026-09-29", "2026-9-29", "2026-02-30", "2025-02-29", "2026-13-01", "2026-00-10", "2026-09-00", "1900-02-29", "2026-09-29T00:00:00Z", null, 20260929]) {
+      expect(isCalendarDate(bad)).toBe(false);
+    }
+  });
+
+  test("localCalendarDate is the local day, zero-padded", () => {
+    expect(localCalendarDate(new Date(2026, 0, 5, 0, 0))).toBe("2026-01-05");
+    expect(localCalendarDate(new Date(2026, 11, 31, 23, 59))).toBe("2026-12-31");
   });
 });

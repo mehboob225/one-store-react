@@ -14,6 +14,7 @@ import {
   type TaskTagRow,
   type UserRow,
 } from "./fixtures";
+import { isCalendarDate } from "../models/calendarDate";
 import { hasField } from "../store/canonicalKey";
 import { MUTABLE_TASK_FIELDS, validateNewTask, validateTaskEnvelope, validateTaskFields, type MutableTaskField, type Validated } from "./validation";
 
@@ -362,6 +363,7 @@ function assertSeedInvariants(data: SeedData): void {
   for (const task of data.tasks) {
     if (!projectIds.has(task.project_id)) fail(`task ${task.id} belongs to missing project ${task.project_id}`);
     if (task.assignee_id !== null && !userIds.has(task.assignee_id)) fail(`task ${task.id} assignee ${task.assignee_id} is not a user`);
+    if (task.due_on !== null && !isCalendarDate(task.due_on)) fail(`task ${task.id} due_on "${task.due_on}" is not a YYYY-MM-DD date`);
     // deliberately NOT asserted: assignee ∈ members. The write rule applies to a CHANGED assignee only,
     // so a task may keep an assignee who has since left the project (docs/API.md).
   }
