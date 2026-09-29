@@ -7,7 +7,7 @@
  */
 import { readdir, unlink } from "node:fs/promises";
 import { ModelDefinitions } from "../src/store/ModelDefinitions";
-import { generateModels, OWNED_DIRECTORIES, OWNED_FILE_SUFFIX } from "../src/models/generator/generate";
+import { generateModels, modelPath, OWNED_DIRECTORIES, OWNED_FILE_SUFFIX } from "../src/models/generator/generate";
 
 const check = process.argv.includes("--check");
 const root = new URL("..", import.meta.url);
@@ -38,6 +38,13 @@ for (const dir of OWNED_DIRECTORIES) {
       console.log(`deleted orphan ${path}`);
     }
   }
+}
+
+// The generated code types buckets with the handwritten model classes; the generator never writes those.
+for (const def of Object.values(ModelDefinitions)) {
+  const model = "model" in def ? def.model : undefined;
+  if (model === undefined || (await Bun.file(new URL(modelPath(model), root)).exists())) continue;
+  console.warn(`missing handwritten model ${modelPath(model)}: add \`export class ${model} extends ${model}AppData {}\` (see src/models/*.ts)`);
 }
 
 if (check) {
