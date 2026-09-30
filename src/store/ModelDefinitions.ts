@@ -325,7 +325,7 @@ const RESERVED_CLASS_NAMES = new Set([
   "parseInt", "parseFloat", "isNaN", "isFinite", "encodeURI", "encodeURIComponent", "decodeURI", "decodeURIComponent",
   "escape", "unescape", "globalThis", "undefined", "NaN", "Infinity",
   // the generator's own classes and registries (step 8)
-  "PassiveModel", "DataCache", "DataCacheIndex", "AppDataFactory", "AppDataModelFactory", "ModelConstructors",
+  "PassiveModel", "DataCache", "DataCacheIndex", "AppDataFactory", "AppDataModelFactory", "ModelFactory", "ModelConstructors",
 ]);
 
 /** The generator emits `<Model>AppData` base classes, so no model may take that suffix itself. */

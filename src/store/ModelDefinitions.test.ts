@@ -594,7 +594,7 @@ describe("validateModelDefinitions", () => {
   });
 
   test("model names may not clash with the generator's own classes or its AppData suffix (review 8, finding 8)", () => {
-    for (const model of ["DataCache", "DataCacheIndex", "AppDataFactory", "AppDataModelFactory", "ModelConstructors"]) {
+    for (const model of ["DataCache", "DataCacheIndex", "AppDataFactory", "AppDataModelFactory", "ModelFactory", "ModelConstructors"]) {
       expect(withDefs({ things: { index: "id", model } })).toEqual([`things: model "${model}" is a reserved name`]);
     }
     expect(withDefs({ a: { index: "id", model: "X" }, b: { index: "id", model: "XAppData" } })).toEqual([

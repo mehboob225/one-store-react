@@ -44,6 +44,12 @@ only by the tab that performs the transition. Persisted UI state must use that p
 - Every factory method ends in a store write (`saveAppData` / `deleteAppData`).
 - Model classes extend their generated `*AppData` base and declare fields with `declare` (the base
   constructor assigns the JSON; a plain field would reset it to `undefined`).
+- A model lives at `src/models/<Model>.ts` (the generated code imports its type from there) and is
+  registered in `ModelConstructors` (`src/store/AppDataModelFactory.ts`; the map's type rejects a
+  missing or mismatched entry). A model method must not share a name with a server field:
+  `initializeFromJson` throws on a field that would shadow a member.
+- Raw JSON reaches the store only through `AppDataModelFactory.addData`, which lifts embedded
+  objects into their buckets and writes nothing if any record is bad.
 - A model's accessors resolve through the store that holds it (`storeOf(model)`, set when a bucket
   stores it); nothing under `src/models` imports `AppDataFactory`.
 

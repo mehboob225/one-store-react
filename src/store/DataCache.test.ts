@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { PassiveModel, storeOf } from "../models/generator/PassiveModel";
-import { CurrentUserModelAppData } from "../models/appdata/CurrentUserModelAppData";
-import { ProjectModelAppData } from "../models/appdata/ProjectModelAppData";
-import { TagModelAppData } from "../models/appdata/TagModelAppData";
 import { TaskModelAppData } from "../models/appdata/TaskModelAppData";
-import { UserModelAppData } from "../models/appdata/UserModelAppData";
+import { CurrentUserModel } from "../models/CurrentUserModel";
+import { ProjectModel } from "../models/ProjectModel";
+import { TagModel } from "../models/TagModel";
+import { TaskModel } from "../models/TaskModel";
+import { UserModel } from "../models/UserModel";
 import { AppDataFactory } from "./AppDataFactory";
 import { DataCache } from "./DataCache";
 import { objectTypes, validateModelDefinitions } from "./ModelDefinitions";
@@ -27,8 +28,8 @@ describe("DataCache", () => {
     const heard: string[] = [];
     cache.eventsHandler.subscribe({ objectType: "tasks" }, (b) => heard.push(b.key));
     cache.updatedHandler.subscribe((type) => heard.push(`updated:${type}`));
-    cache.projects.add([new ProjectModelAppData({ id: 1, owner_id: 1, member_ids: [1] })]);
-    cache.tasks.add([new TaskModelAppData({ id: 1, project_id: 1 })]);
+    cache.projects.add([new ProjectModel({ id: 1, owner_id: 1, member_ids: [1] })]);
+    cache.tasks.add([new TaskModel({ id: 1, project_id: 1 })]);
     cache.current_users.addMetaData(1, "subscription", { plan: "pro" });
     cache.eventsHandler.flush();
     heard.length = 0;
@@ -47,9 +48,9 @@ describe("DataCache", () => {
     const cache = new DataCache();
     const updated: string[] = [];
     cache.updatedHandler.subscribe((type) => updated.push(type));
-    cache.projects.add([new ProjectModelAppData({ id: 1 })]);
-    cache.tasks.add([new TaskModelAppData({ id: 1, project_id: 1 }), new TaskModelAppData({ id: 2, project_id: 1 })]);
-    cache.tasks.add([new TaskModelAppData({ id: 3, project_id: 1 })]);
+    cache.projects.add([new ProjectModel({ id: 1 })]);
+    cache.tasks.add([new TaskModel({ id: 1, project_id: 1 }), new TaskModel({ id: 2, project_id: 1 })]);
+    cache.tasks.add([new TaskModel({ id: 3, project_id: 1 })]);
     expect(updated).toEqual([]); // nothing until the microtask flush
     cache.eventsHandler.flush();
     expect(updated).toEqual(["projects", "tasks"]);
@@ -67,7 +68,7 @@ describe("DataCache", () => {
     cache.eventsHandler.subscribe({ objectType: "tags" }, () => {
       throw new Error("events listener");
     });
-    cache.tags.add([new TagModelAppData({ id: 1 })]);
+    cache.tags.add([new TagModel({ id: 1 })]);
     cache.eventsHandler.flush();
     expect(errors.map((e) => (e as Error).message).sort()).toEqual(["events listener", "updated listener"]);
   });
@@ -79,8 +80,7 @@ describe("AppDataFactory and the generated accessors", () => {
   afterEach(() => AppDataFactory.reset());
 
   const row = <T>(fields: Record<string, unknown>) => fields as T;
-  /** The bases type only the key fields (step 9's models add the rest), so a data field is read through the record. */
-  const nameOf = (model: object | undefined) => (model as { name?: string } | undefined)?.name;
+  const nameOf = (model: { name: string } | undefined) => model?.name;
 
   test("is a DataCache on the built-in schema", () => {
     expect(AppDataFactory).toBeInstanceOf(DataCache);
@@ -88,11 +88,11 @@ describe("AppDataFactory and the generated accessors", () => {
   });
 
   test("foreignKeys, foreignKeysArray, relatedObjectType and hasMany accessors read the store", () => {
-    AppDataFactory.users.add([new UserModelAppData({ id: 1, name: "Ada" }), new UserModelAppData({ id: 2, name: "Grace" })]);
-    AppDataFactory.projects.add([new ProjectModelAppData({ id: 1, owner_id: 1, member_ids: [1, 2, 99] })]);
-    AppDataFactory.tasks.add([new TaskModelAppData({ id: 1, project_id: 1, assignee_id: 2 }), new TaskModelAppData({ id: 2, project_id: 1, assignee_id: null })]);
+    AppDataFactory.users.add([new UserModel({ id: 1, name: "Ada" }), new UserModel({ id: 2, name: "Grace" })]);
+    AppDataFactory.projects.add([new ProjectModel({ id: 1, owner_id: 1, member_ids: [1, 2, 99] })]);
+    AppDataFactory.tasks.add([new TaskModel({ id: 1, project_id: 1, assignee_id: 2 }), new TaskModel({ id: 2, project_id: 1, assignee_id: null })]);
     AppDataFactory.comments.add([row({ id: 1, task_id: 1, author_id: 1 }), row({ id: 2, task_id: 2, author_id: 1 })]);
-    AppDataFactory.tags.add([new TagModelAppData({ id: 1, name: "bug" }), new TagModelAppData({ id: 2, name: "ui" })]);
+    AppDataFactory.tags.add([new TagModel({ id: 1, name: "bug" }), new TagModel({ id: 2, name: "ui" })]);
     AppDataFactory.task_tags_relation.add([row({ id: "1-2", task_id: 1, tag_id: 2 }), row({ id: "1-1", task_id: 1, tag_id: 1 })]);
 
     const project = AppDataFactory.projects.getById(1)!;
@@ -101,6 +101,7 @@ describe("AppDataFactory and the generated accessors", () => {
     expect(project.getTasks().map((t) => t.id)).toEqual([1, 2]);
 
     const task = AppDataFactory.tasks.getById(1)!;
+    expect(task).toBeInstanceOf(TaskModel);
     expect(task).toBeInstanceOf(TaskModelAppData);
     expect(task.getProject()).toBe(project);
     expect(nameOf(task.getAssignee())).toBe("Grace");
@@ -113,18 +114,18 @@ describe("AppDataFactory and the generated accessors", () => {
     // accessors follow the store, not a snapshot
     AppDataFactory.task_tags_relation.remove("1-2");
     expect(task.getTags().map(nameOf)).toEqual(["bug"]);
-    AppDataFactory.projects.add([new ProjectModelAppData({ id: 1, owner_id: 2, member_ids: [2] })]);
+    AppDataFactory.projects.add([new ProjectModel({ id: 1, owner_id: 2, member_ids: [2] })]);
     expect(nameOf(task.getProject()?.getOwner())).toBe("Grace");
   });
 
   test("a metaData key is a getter on the model", () => {
-    AppDataFactory.current_users.add([new CurrentUserModelAppData({ id: 1, name: "Ada" })]);
+    AppDataFactory.current_users.add([new CurrentUserModel({ id: 1, name: "Ada" })]);
     const me = AppDataFactory.current_users.getById(1)!;
     expect(me.getSubscription()).toBeUndefined();
     AppDataFactory.current_users.addMetaData(1, "subscription", { plan: "pro" });
     expect(me.getSubscription()).toEqual({ plan: "pro" });
     // the same name arriving inline in the JSON is an ordinary data field, not a collision (step 8 review, finding 1)
-    const inline = new CurrentUserModelAppData({ id: 2, subscription: { plan: "free" } });
+    const inline = new CurrentUserModel({ id: 2, subscription: { plan: "free" } });
     expect((inline as unknown as { subscription: unknown }).subscription).toEqual({ plan: "free" });
     AppDataFactory.current_users.add([inline]);
     expect(inline.getSubscription()).toBeUndefined(); // side data is only what addMetaData attached
@@ -132,11 +133,11 @@ describe("AppDataFactory and the generated accessors", () => {
 
   test("accessors resolve through the store that holds the model, not the singleton (step 8 review, finding 6)", () => {
     const own = new DataCache();
-    const task = new TaskModelAppData({ id: 1, project_id: 1 });
+    const task = new TaskModel({ id: 1, project_id: 1 });
     expect(() => task.getProject()).toThrow(/not held by a store/); // never added anywhere
-    own.projects.add([new ProjectModelAppData({ id: 1, owner_id: 1 })]);
+    own.projects.add([new ProjectModel({ id: 1, owner_id: 1 })]);
     own.tasks.add([task]);
-    AppDataFactory.projects.add([new ProjectModelAppData({ id: 1, owner_id: 9 })]); // a different project 1 in the singleton
+    AppDataFactory.projects.add([new ProjectModel({ id: 1, owner_id: 9 })]); // a different project 1 in the singleton
     expect(task.getProject()).toBe(own.projects.getById(1));
     expect(task.getProject()?.owner_id).toBe(1);
     expect(storeOf(task)).toBe(own);

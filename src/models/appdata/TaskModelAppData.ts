@@ -3,19 +3,19 @@
 import { PassiveModel, storeOf } from "../generator/PassiveModel";
 import type { DataCache, CommentsRecord, TaskTagsRelationRecord } from "../../store/DataCache";
 import type { IndexValue } from "../../store/EventHandler";
-import type { ProjectModelAppData } from "./ProjectModelAppData";
-import type { TagModelAppData } from "./TagModelAppData";
-import type { UserModelAppData } from "./UserModelAppData";
+import type { ProjectModel } from "../ProjectModel";
+import type { TagModel } from "../TagModel";
+import type { UserModel } from "../UserModel";
 
 export class TaskModelAppData extends PassiveModel<DataCache> {
   declare id: IndexValue;
   declare project_id?: IndexValue | null;
   declare assignee_id?: IndexValue | null;
 
-  getProject(): ProjectModelAppData | undefined {
+  getProject(): ProjectModel | undefined {
     return storeOf(this).projects.getById(this.project_id);
   }
-  getAssignee(): UserModelAppData | undefined {
+  getAssignee(): UserModel | undefined {
     return storeOf(this).users.getById(this.assignee_id);
   }
   getComments(): readonly CommentsRecord[] {
@@ -24,7 +24,7 @@ export class TaskModelAppData extends PassiveModel<DataCache> {
   getTagLinks(): readonly TaskTagsRelationRecord[] {
     return storeOf(this).task_tags_relation.getGroupedById("task_id", this.id);
   }
-  getTags(): TagModelAppData[] {
-    return storeOf(this).tasks.getAssociation<TagModelAppData>("task_tags_relation", "task_id", "tag_id", this.id);
+  getTags(): TagModel[] {
+    return storeOf(this).tasks.getAssociation<TagModel>("task_tags_relation", "task_id", "tag_id", this.id);
   }
 }

@@ -400,6 +400,7 @@ describe("projects and tasks", () => {
       /task 99 belongs to missing project 42/,
     );
     expect(broken((d) => (d.tasks[0]!.assignee_id = 999))).toThrow(/task 1 assignee 999 is not a user/);
+    expect(broken((d) => (d.tasks[0]!.due_on = ""))).toThrow(/task 1 due_on "" is not a YYYY-MM-DD date/);
     expect(broken((d) => d.comments.push({ id: 99, task_id: 42, author_id: 1, body: "x", created_at: "" }))).toThrow(/comment 99 belongs to missing task 42/);
     expect(broken((d) => d.task_tags.push({ task_id: 1, tag_id: 42 }))).toThrow(/task_tags link 1-42 references a missing row/);
     expect(broken((d) => d.projects[0]!.member_ids.push(42))).toThrow(/project 1 member 42 is not a user/);
@@ -485,6 +486,8 @@ describe("projects and tasks", () => {
     expect(await bad({ title: "ok", status: "archived" })).toContain("task.status");
     expect(await bad({ title: "ok", assignee_id: "1" })).toContain("task.assignee_id");
     expect(await bad({ title: "ok", due_on: 42 })).toContain("task.due_on");
+    expect(await bad({ title: "ok", due_on: "" })).toContain("task.due_on");
+    expect(await bad({ title: "ok", due_on: "2026-02-30" })).toContain("task.due_on");
     expect(await bad("just a string")).toContain("task");
     expect(await bad(null)).toContain("task");
     expect(await count()).toBe(before);
@@ -529,6 +532,9 @@ describe("projects and tasks", () => {
     expect(await bad({ title: "" })).toContain("task.title");
     expect(await bad({ assignee_id: "1" })).toContain("task.assignee_id");
     expect(await bad({ due_on: 42 })).toContain("task.due_on");
+    expect(await bad({ due_on: "" })).toContain("task.due_on");
+    expect(await bad({ due_on: "soon" })).toContain("task.due_on");
+    expect(await bad({ due_on: "2026-9-1" })).toContain("task.due_on");
     // no string hash = malformed request (400), not a conflict — see the ordering test
     expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: {} }) })).status).toBe(400);
     expect((await api("/tasks/1", { method: "PUT", body: JSON.stringify({ task: "nope" }) })).status).toBe(400);

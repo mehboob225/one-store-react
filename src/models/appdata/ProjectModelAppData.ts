@@ -3,21 +3,21 @@
 import { PassiveModel, storeOf } from "../generator/PassiveModel";
 import type { DataCache } from "../../store/DataCache";
 import type { IndexValue } from "../../store/EventHandler";
-import type { TaskModelAppData } from "./TaskModelAppData";
-import type { UserModelAppData } from "./UserModelAppData";
+import type { TaskModel } from "../TaskModel";
+import type { UserModel } from "../UserModel";
 
 export class ProjectModelAppData extends PassiveModel<DataCache> {
   declare id: IndexValue;
   declare owner_id?: IndexValue | null;
   declare member_ids?: readonly IndexValue[] | null;
 
-  getOwner(): UserModelAppData | undefined {
+  getOwner(): UserModel | undefined {
     return storeOf(this).users.getById(this.owner_id);
   }
-  getMembers(): UserModelAppData[] {
+  getMembers(): UserModel[] {
     return storeOf(this).users.getMultipleByIds(this.member_ids ?? []);
   }
-  getTasks(): readonly TaskModelAppData[] {
+  getTasks(): readonly TaskModel[] {
     return storeOf(this).tasks.getGroupedById("project_id", this.id);
   }
 }

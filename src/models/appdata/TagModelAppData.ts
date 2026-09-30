@@ -3,7 +3,7 @@
 import { PassiveModel, storeOf } from "../generator/PassiveModel";
 import type { DataCache, TaskTagsRelationRecord } from "../../store/DataCache";
 import type { IndexValue } from "../../store/EventHandler";
-import type { TaskModelAppData } from "./TaskModelAppData";
+import type { TaskModel } from "../TaskModel";
 
 export class TagModelAppData extends PassiveModel<DataCache> {
   declare id: IndexValue;
@@ -11,7 +11,7 @@ export class TagModelAppData extends PassiveModel<DataCache> {
   getTaskLinks(): readonly TaskTagsRelationRecord[] {
     return storeOf(this).task_tags_relation.getGroupedById("tag_id", this.id);
   }
-  getTasks(): TaskModelAppData[] {
-    return storeOf(this).tags.getAssociation<TaskModelAppData>("task_tags_relation", "tag_id", "task_id", this.id);
+  getTasks(): TaskModel[] {
+    return storeOf(this).tags.getAssociation<TaskModel>("task_tags_relation", "tag_id", "task_id", this.id);
   }
 }

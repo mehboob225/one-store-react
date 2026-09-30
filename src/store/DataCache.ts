@@ -10,11 +10,11 @@
 import { DataCacheIndex, type BucketContext } from "./DataCacheIndex";
 import { DataEventHandler, EventHandler, type IndexValue, type ListenerErrorHandler } from "./EventHandler";
 import { assertValidModelDefinitions, ModelDefinitions, type ModelDefinition } from "./ModelDefinitions";
-import type { UserModelAppData } from "../models/appdata/UserModelAppData";
-import type { CurrentUserModelAppData } from "../models/appdata/CurrentUserModelAppData";
-import type { ProjectModelAppData } from "../models/appdata/ProjectModelAppData";
-import type { TaskModelAppData } from "../models/appdata/TaskModelAppData";
-import type { TagModelAppData } from "../models/appdata/TagModelAppData";
+import type { UserModel } from "../models/UserModel";
+import type { CurrentUserModel } from "../models/CurrentUserModel";
+import type { ProjectModel } from "../models/ProjectModel";
+import type { TaskModel } from "../models/TaskModel";
+import type { TagModel } from "../models/TagModel";
 
 /** Rows of `comments`: no model class; only the declared key fields are typed. */
 export interface CommentsRecord extends Record<string, unknown> {
@@ -37,12 +37,12 @@ export class DataCache {
   generation = 0;
   private readonly buckets: ReadonlyMap<string, DataCacheIndex<object>>;
 
-  readonly users: DataCacheIndex<UserModelAppData>;
-  readonly current_users: DataCacheIndex<CurrentUserModelAppData>;
-  readonly projects: DataCacheIndex<ProjectModelAppData>;
-  readonly tasks: DataCacheIndex<TaskModelAppData>;
+  readonly users: DataCacheIndex<UserModel>;
+  readonly current_users: DataCacheIndex<CurrentUserModel>;
+  readonly projects: DataCacheIndex<ProjectModel>;
+  readonly tasks: DataCacheIndex<TaskModel>;
   readonly comments: DataCacheIndex<CommentsRecord>;
-  readonly tags: DataCacheIndex<TagModelAppData>;
+  readonly tags: DataCacheIndex<TagModel>;
   readonly task_tags_relation: DataCacheIndex<TaskTagsRelationRecord>;
 
   /** The buckets are generated for ModelDefinitions, so that is the only schema a DataCache can hold. */
@@ -53,17 +53,17 @@ export class DataCache {
     const buckets = new Map<string, DataCacheIndex<object>>();
     const context: BucketContext = { events: this.eventsHandler, bucket: (objectType) => buckets.get(objectType), owner: this };
     const definitions: Record<string, ModelDefinition> = ModelDefinitions;
-    this.users = new DataCacheIndex<UserModelAppData>("users", definitions, context);
+    this.users = new DataCacheIndex<UserModel>("users", definitions, context);
     buckets.set("users", this.users);
-    this.current_users = new DataCacheIndex<CurrentUserModelAppData>("current_users", definitions, context);
+    this.current_users = new DataCacheIndex<CurrentUserModel>("current_users", definitions, context);
     buckets.set("current_users", this.current_users);
-    this.projects = new DataCacheIndex<ProjectModelAppData>("projects", definitions, context);
+    this.projects = new DataCacheIndex<ProjectModel>("projects", definitions, context);
     buckets.set("projects", this.projects);
-    this.tasks = new DataCacheIndex<TaskModelAppData>("tasks", definitions, context);
+    this.tasks = new DataCacheIndex<TaskModel>("tasks", definitions, context);
     buckets.set("tasks", this.tasks);
     this.comments = new DataCacheIndex<CommentsRecord>("comments", definitions, context);
     buckets.set("comments", this.comments);
-    this.tags = new DataCacheIndex<TagModelAppData>("tags", definitions, context);
+    this.tags = new DataCacheIndex<TagModel>("tags", definitions, context);
     buckets.set("tags", this.tags);
     this.task_tags_relation = new DataCacheIndex<TaskTagsRelationRecord>("task_tags_relation", definitions, context);
     buckets.set("task_tags_relation", this.task_tags_relation);
