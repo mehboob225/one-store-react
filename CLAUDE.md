@@ -48,6 +48,9 @@ only by the tab that performs the transition. Persisted UI state must use that p
   registered in `ModelConstructors` (`src/store/AppDataModelFactory.ts`; the map's type rejects a
   missing or mismatched entry). A model method must not share a name with a server field:
   `initializeFromJson` throws on a field that would shadow a member.
+- The network is reached only through `APIService` (`src/api/`). A response writes itself into the store
+  through its promise extensions (`saveAppData`, `saveMetaData`, `saveObjectsBelongingTo`, `deleteAppData*`);
+  a write from a request made before `AppDataFactory.reset()` is dropped, and its failure is not dispatched.
 - Raw JSON reaches the store only through `AppDataModelFactory.addData`, which lifts embedded
   objects into their buckets and writes nothing if any record is bad.
 - A model's accessors resolve through the store that holds it (`storeOf(model)`, set when a bucket
